@@ -1,0 +1,12 @@
+# Copy this file to .dev.vars and fill in. NEVER commit .dev.vars.
+#
+# MASTER_KEY: 32 random bytes, base64 (44 chars, ends with "="). Encrypts all stored tokens.
+#   Generate: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+#   WARNING: losing MASTER_KEY means stored account tokens can never be decrypted (re-bind accounts).
+MASTER_KEY=
+
+# Console login password (ADMIN_TOKEN). Choose your own strong value.
+ADMIN_TOKEN=
+
+# Optional separate secret for POST /cron. If empty, ADMIN_TOKEN is used.
+CRON_SECRET=

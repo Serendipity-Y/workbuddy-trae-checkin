@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "workbuddy-trae-checkin",
+  "main": "worker.js",
+  "compatibility_date": "2025-06-01",
+  // Local dev ignores the id. For Cloudflare deployment, create a KV namespace
+  // and replace the id below with your real namespace id.
+  "kv_namespaces": [
+    { "binding": "KV", "id": "00000000000000000000000000000000" }
+  ],
+  "triggers": { "crons": ["10 0 * * *"] },
+  "observability": { "enabled": true }
+}

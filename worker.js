@@ -1724,6 +1724,16 @@ async function checkinStatus(at) {
   return { ok: true, data: json.data };
 }
 
+/** 剩余积分余额：此接口不带 /v2 前缀（带前缀会 404） */
+async function resourceBalance(at) {
+  const { json } = await wbFetch('/billing/meter/get-user-resource-summary', {
+    headers: authHeader(at),
+  });
+  if (json?.code !== 0 || !json?.data) return null;
+  const n = Number(json.data.TotalCredits);
+  return Number.isFinite(n) ? n : null;
+}
+
 async function doCheckin(at) {
   const { json } = await wbFetch('/v2/billing/meter/daily-checkin', {
     headers: authHeader(at),
@@ -1790,6 +1800,16 @@ async function signinOne(env, acct, { force = false } = {}) {
     }
   } catch {
     /* 状态查询失败不影响主流程 */
+  }
+
+  try {
+    const bal = await resourceBalance(tokens.accessToken);
+    if (bal != null) {
+      acct.balance = bal;
+      acct.balanceAt = now;
+    }
+  } catch {
+    /* 余额查询失败不影响签到 */
   }
 
   acct.lastRun = now;
@@ -1896,6 +1916,9 @@ async function handleLoginPoll(request, env) {
 async function handleList(request, env) {
   const list = await listAccounts(env);
   const out = [];
+  const now = Date.now();
+  const day = (ms) => new Date(ms + 8 * 3600e3).toISOString().slice(0, 10);
+  const today = day(now);
   for (const meta of list) {
     const a = await getAccount(env, meta.id);
     if (!a) continue;
@@ -1906,8 +1929,13 @@ async function handleList(request, env) {
       lastMsg: a.lastMsg,
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
+      today,
+      signedToday: a.lastOkDate === today,
+      ranToday: a.lastRun ? day(a.lastRun) === today : false,
       streak: a.streak ?? null,
       total: a.total ?? null,
+      balance: typeof a.balance === 'number' ? Math.round(a.balance * 100) / 100 : null,
+      balanceAt: a.balanceAt ?? null,
       totalSigned: a.totalSigned ?? 0,
       // 永远不返回令牌，连指纹都不给
     });
@@ -2245,6 +2273,16 @@ function authHeaders(at, region, extra) {
   return extra ? Object.assign(h, extra) : h;
 }
 
+/** 剩余 credits = 套餐内剩余 + 资源包剩余（签到赠送进资源包） */
+async function quotaBalance(at, region) {
+  const r = await qoderFetch(region, '/api/v2/quota/usage', { headers: authHeaders(at, region) });
+  if (r.status !== 200 || !r.json) return null;
+  const u = r.json.userQuota || {};
+  const a = r.json.addOnQuota || {};
+  const n = Number(u.remaining || 0) + Number(a.remaining || 0);
+  return Number.isFinite(n) ? n : null;
+}
+
 /* 客户端伪装：活动列表会按「请求来自哪个客户端版本 / 哪台设备」决定下发哪些活动。
    缺设备身份时服务端会静默退化成只给营销卡（VIEW_DETAILS），拿不到「每天领 credits」那条。 */
 // 客户端自报的版本号。服务端会按它决定下发哪些活动——版本太旧时只推营销活动、不给每日签到。
@@ -2552,6 +2590,16 @@ async function signinOne(env, acct, { force = false } = {}) {
     return { id: acct.id, label: acct.label, state: acct.lastState, msg: e.message };
   }
 
+  try {
+    const bal = await quotaBalance(at, regionOf(acct.region));
+    if (bal != null) {
+      acct.balance = bal;
+      acct.balanceAt = now;
+    }
+  } catch {
+    /* 余额查询失败不影响签到 */
+  }
+
   // 用局部变量判断这次的结果，别沿用上一次运行留下的 lastState
   let failed = '';
   if (list.status === 429) {
@@ -2693,6 +2741,8 @@ async function handleList(request, env) {
       lastOkDate: a.lastOkDate ?? null,
       lastCredit: a.lastCredit ?? null,
       totalCredit: a.totalCredit ?? 0,
+      balance: typeof a.balance === 'number' ? Math.round(a.balance * 100) / 100 : null,
+      balanceAt: a.balanceAt ?? null,
       totalSigned: a.totalSigned ?? 0,
       cooldownUntil: Number(a.cooldownUntil || 0) > now ? a.cooldownUntil : 0,
       today,
@@ -3612,7 +3662,7 @@ const PAGE = `<!DOCTYPE html>
   .chip b{color:var(--txt);font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12px}
   .chip .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
 
-  /* GitHub 仓库入口 */
+  /* 余额总览入口 */
   .gh{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:11px 15px;border-radius:12px;
       border:1px solid var(--line-2);background:var(--surface);color:var(--txt);font-size:13px;font-weight:600;
       text-decoration:none;white-space:nowrap;
@@ -3813,10 +3863,7 @@ const PAGE = `<!DOCTYPE html>
       </div>
       <div class="row">
         <span class="chip"><i class="dot"></i>今日已签 <b id="statAll">—</b></span>
-        <a class="gh" href="https://github.com/ggzhzc/workbuddy-trae-checkin" target="_blank" rel="noopener noreferrer" title="GitHub 仓库 · ggzhzc/workbuddy-trae-checkin" aria-label="GitHub 仓库">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5C5.73.5.9 5.34.9 11.6c0 4.91 3.17 9.07 7.57 10.53.55.1.75-.24.75-.53 0-.26-.01-1.13-.02-2.05-3.08.67-3.73-1.31-3.73-1.31-.5-1.28-1.23-1.62-1.23-1.62-1-.69.08-.67.08-.67 1.11.08 1.7 1.14 1.7 1.14.98 1.69 2.58 1.2 3.21.92.1-.72.39-1.21.7-1.48-2.46-.28-5.05-1.23-5.05-5.48 0-1.21.43-2.2 1.14-2.98-.12-.28-.5-1.41.11-2.94 0 0 .93-.3 3.05 1.14a10.5 10.5 0 0 1 5.56 0c2.11-1.44 3.04-1.14 3.04-1.14.61 1.53.23 2.66.11 2.94.71.78 1.14 1.77 1.14 2.98 0 4.26-2.6 5.19-5.07 5.47.4.34.75 1.01.75 2.04 0 1.48-.01 2.68-.01 3.04 0 .29.19.64.76.53 4.4-1.46 7.56-5.62 7.56-10.53C23.1 5.34 18.27.5 12 .5z"/></svg>
-          <span class="gh-t">GitHub</span>
-        </a>
+        <a class="gh" href="/" title="返回余额总览">余额总览</a>
         <button id="runAll" class="pri">全部签到</button>
         <button id="notifyOpen" title="配置签到结果通知">通知</button>
         <button id="logout">退出登录</button>
@@ -3827,6 +3874,7 @@ const PAGE = `<!DOCTYPE html>
       <button class="tab on" data-tab="trae">Trae <b id="cntTrae">0</b></button>
       <button class="tab" data-tab="wb">WorkBuddy <b id="cntWb">0</b></button>
       <button class="tab" data-tab="qoder">Qoder <b id="cntQoder">0</b></button>
+      <button class="tab" data-tab="agentrouter">AgentRouter <b id="cntAgentRouter">0</b></button>
     </nav>
 
     <section class="panel" id="panel-trae">
@@ -3883,6 +3931,27 @@ const PAGE = `<!DOCTYPE html>
             </div>
             <div class="hint" id="wbQrStatus">点按钮在新窗口打开官方登录页，用微信扫码并确认，账号会自动保存。</div>
             <div class="hint">二维码由官方登录页渲染，本服务不接触你的微信信息。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-agentrouter" hidden>
+      <div class="grid">
+        <div class="col">
+          <div class="card actions">
+            <button data-refresh="agentrouter">刷新</button>
+            <div class="err" id="err-agentrouter"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>AgentRouter 账号</h2><span class="meta" id="lastRun-agentrouter">—</span></div>
+            <div class="list" id="list-agentrouter"><div class="empty">加载中…</div></div>
+          </div>
+        </div>
+        <div class="col">
+          <div class="card">
+            <div class="card-head"><h2>说明</h2></div>
+            <div class="hint">AgentRouter 采用「登录式签到」：本机签到脚本每天登录一次自动领取 $25，并把最新余额推送到这里。此页只读，签到由计划任务 AgentRouter-CheckIn（每日 10:20 / 22:20）在本机执行。</div>
           </div>
         </div>
       </div>
@@ -4109,6 +4178,25 @@ function renderWb(d){
   bindDel();
 }
 
+function renderAgentRouter(d){
+  var box = $('#list-agentrouter'), accs = (d.accounts || []);
+  var upd = accs.filter(function(a){ return a.updatedToday; }).length;
+  $('#cntAgentRouter').textContent = upd + '/' + accs.length;
+  function t(ms){ return ms ? new Date(ms + 8 * 3600e3).toISOString().replace('T',' ').slice(5,16) : '—'; }
+  $('#lastRun-agentrouter').textContent = accs.length ? t(accs[0].balanceAt) : '—';
+  if(!accs.length){ box.innerHTML = '<div class="empty">还没有余额记录：运行本机 AgentRouter 签到脚本后自动出现</div>'; return; }
+  box.innerHTML = '<table><thead><tr><th>账号</th><th>余额</th><th>更新时间</th><th>状态</th></tr></thead><tbody>'
+    + accs.map(function(a){
+        return '<tr>'
+          + '<td>' + esc(a.label) + '</td>'
+          + '<td class="num">' + ('$' + (a.balance != null ? Number(a.balance).toFixed(2) : '—')) + '</td>'
+          + '<td class="time">' + esc(t(a.balanceAt)) + '</td>'
+          + '<td>' + (a.updatedToday ? '<span class="tag t-ok">今日已更新</span>' : '<span class="tag t-idle">未更新</span>') + '</td>'
+          + '</tr>';
+      }).join('') + '</tbody></table>'
+    + '<div class="thint">余额由本机签到脚本推送，此页只读</div>';
+}
+
 function renderQoder(d){
   var box = $('#list-qoder'), now = Date.now();
   state.data.qoder = d;
@@ -4214,7 +4302,7 @@ function renderStat(){
 /* ---------------- 加载与签到 ---------------- */
 
 var API_URL = {
-  list:  { trae:'/trae/api/list', wb:'/wb/api/list', qoder:'/qoder/api/list' },
+  list:  { trae:'/trae/api/list', wb:'/wb/api/list', qoder:'/qoder/api/list', agentrouter:'/agentrouter/api/list' },
   run:   { trae:'/trae/api/run?force=1', wb:'/wb/api/run?force=1', qoder:'/qoder/api/run?force=1' },
   rename:{ trae:'/trae/api/rename', wb:'/wb/api/rename', qoder:'/qoder/api/rename' },
   remove:{ trae:'/trae/api/accounts/remove', wb:'/wb/api/remove', qoder:'/qoder/api/remove' },
@@ -4224,7 +4312,8 @@ var API_URL = {
 function load(p){
   return api(API_URL.list[p])
     .then(function(d){
-      if(p === 'trae') renderTrae(d);
+      if(p === 'agentrouter') renderAgentRouter(d);
+      else if(p === 'trae') renderTrae(d);
       else if(p === 'wb') renderWb(d);
       else renderQoder(d);
       renderStat();
@@ -4233,7 +4322,7 @@ function load(p){
 }
 
 function loadAll(){
-  return Promise.all([load('trae'), load('wb'), load('qoder')]);
+  return Promise.all([load('trae'), load('wb'), load('qoder'), load('agentrouter')]);
 }
 
 function runOne(p){
@@ -4282,7 +4371,7 @@ document.querySelectorAll('.tab').forEach(function(t){
     var p = t.dataset.tab;
     state.tab = p;
     document.querySelectorAll('.tab').forEach(function(x){ x.classList.toggle('on', x === t); });
-    ['trae','wb','qoder'].forEach(function(k){ $('#panel-' + k).hidden = p !== k; });
+    ['trae','wb','qoder','agentrouter'].forEach(function(k){ $('#panel-' + k).hidden = p !== k; });
   };
 });
 
@@ -4681,6 +4770,100 @@ if(saved) login(saved);
 /* 入口                                                                */
 /* ------------------------------------------------------------------ */
 
+/* 默认主页：复用控制台整套样式，仅一张额度表 */
+const SHARED_STYLE = (PAGE.match(/<style>[\s\S]*?<\/style>/) || [''])[0];
+const DASHBOARD = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>签到总览</title>
+${SHARED_STYLE}
+</head>
+<body>
+<div class="wrap">
+  <div class="card-head" style="margin-bottom:18px">
+    <div class="brand">
+      <div class="mark"><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg></div>
+      <div>
+        <div class="eyebrow">DAILY CHECK-IN</div>
+        <h1>签到总览</h1>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="refresh">刷新余额</button>
+      <button onclick="location.href='/console'">完整控制台</button>
+      <button id="logout">退出登录</button>
+    </div>
+  </div>
+
+  <div id="loginView">
+    <div class="login-card">
+      <label class="lbl" for="pwd">登录密码</label>
+      <div class="field">
+        <input id="pwd" type="password" placeholder="输入登录密码" autocomplete="current-password">
+        <button id="loginbtn">登录</button>
+      </div>
+      <div class="hint" id="loginerr"></div>
+    </div>
+  </div>
+
+  <div id="mainView" hidden>
+    <div class="card">
+      <div class="card-head">
+        <h2>当前剩余额度</h2>
+        <div class="meta" id="upd">—</div>
+      </div>
+      <div class="list">
+        <table>
+          <thead><tr><th>平台</th><th>账号</th><th>剩余余额</th><th>今日状态</th></tr></thead>
+          <tbody id="rows"><tr><td colspan="4">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="hint">余额在每日签到时自动更新；点「刷新余额」立即重跑一轮。</div>
+    </div>
+  </div>
+</div>
+<script>
+var KEY='signin-admin-pwd';
+var tok=localStorage.getItem(KEY)||'';
+function $(s){return document.querySelector(s);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function fmt(n){return (n==null)?'—':String(n);}
+function api(p){return fetch(p,{headers:{'X-Admin-Token':tok}}).then(function(r){if(r.status===401)throw new Error('auth');return r.json();});}
+function tag(a){if(a.lastState==='token_dead')return '<span class="tag t-bad">令牌失效</span>';if(a.signedToday)return '<span class="tag t-ok">已签</span>';return '<span class="tag t-idle">今日未签</span>';}
+function row(plat,a,bal){return '<tr><td>'+plat+'</td><td>'+esc(a.label)+'</td><td class="num">'+fmt(bal)+'</td><td>'+tag(a)+'</td></tr>';}
+function load(){
+  return Promise.all([api('/trae/api/list'),api('/wb/api/list'),api('/qoder/api/list'),api('/agentrouter/api/list')]).then(function(rs){
+    var html='';
+    (rs[0].accounts||[]).forEach(function(a){html+=row('Trae',a,a.credits);});
+    (rs[1].accounts||[]).forEach(function(a){html+=row('WorkBuddy',a,a.balance);});
+    (rs[2].accounts||[]).forEach(function(a){html+=row('Qoder',a,a.balance);});
+    (rs[3].accounts||[]).forEach(function(a){html+='<tr><td>AgentRouter</td><td>'+esc(a.label)+'</td><td class="num">'+('$'+(a.balance!=null?a.balance.toFixed(2):'—'))+'</td><td>'+(a.updatedToday?'<span class="tag t-ok">已更新</span>':'<span class="tag t-idle">未更新</span>')+'</td></tr>';});
+    $('#rows').innerHTML=html||'<tr><td colspan="4">暂无账号</td></tr>';
+    $('#upd').textContent='更新于 '+new Date().toTimeString().slice(0,8);
+  });
+}
+function logout(){tok='';localStorage.removeItem(KEY);$('#mainView').hidden=true;$('#loginView').hidden=false;}
+function show(){$('#loginView').hidden=true;$('#mainView').hidden=false;load().catch(function(e){if(String(e.message)==='auth')logout();});}
+function login(){
+  var v=$('#pwd').value.trim();if(!v)return;
+  fetch('/api/ping',{headers:{'X-Admin-Token':v}}).then(function(r){if(!r.ok)throw new Error('密码不正确');tok=v;localStorage.setItem(KEY,v);$('#loginerr').textContent='';show();}).catch(function(e){$('#loginerr').textContent=e.message;});
+}
+$('#loginbtn').onclick=login;
+$('#pwd').onkeydown=function(e){if(e.key==='Enter')login();};
+$('#logout').onclick=logout;
+$('#refresh').onclick=function(){
+  var b=$('#refresh');b.disabled=true;b.textContent='刷新中…';
+  var p1=fetch('/api/run-all?force=1',{method:'POST',headers:{'X-Admin-Token':tok}}).catch(function(){});
+  var p2=fetch('http://'+location.hostname+':8788/refresh',{method:'POST'}).catch(function(){});
+  Promise.all([p1,p2]).then(function(){return load();}).catch(function(){}).then(function(){b.disabled=false;b.textContent='刷新余额';});
+};
+if(tok){show();}
+</script>
+</body>
+</html>`;
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -4688,7 +4871,8 @@ export default {
     const method = request.method.toUpperCase();
 
     try {
-      if (path === '/' || path === '/index.html') return htmlResponse(PAGE);
+      if (path === '/' || path === '/index.html') return htmlResponse(DASHBOARD);
+      if (path === '/console') return htmlResponse(PAGE);
 
       if (path === '/cron') {
         const c = requireCron(request, env);
@@ -4777,6 +4961,34 @@ export default {
         };
         const r = await notifyRun(env, demo);
         return json({ ...r, channels: Object.keys(ch) });
+      }
+
+      // AgentRouter 余额：由本机签到脚本推送后存 KV，供主页展示
+      if (path === '/agentrouter/api/balance' && method === 'POST') {
+        const a = requireAdmin(request, env);
+        if (!a.ok) return a.res;
+        const body = await request.json().catch(() => ({}));
+        const bal = Number(body.balance);
+        if (!Number.isFinite(bal)) return json({ error: 'balance 无效' }, 400);
+        const rec = { label: String(body.label || '').slice(0, 40), balance: bal, at: Date.now() };
+        await env.KV.put('agentrouter:balance', JSON.stringify(rec));
+        return json({ ok: true, ...rec });
+      }
+      if (path === '/agentrouter/api/list' && method === 'GET') {
+        const a = requireAdmin(request, env);
+        if (!a.ok) return a.res;
+        const raw = await env.KV.get('agentrouter:balance');
+        const rec = raw ? JSON.parse(raw) : null;
+        const today = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+        const accounts = rec
+          ? [{
+              label: rec.label || 'agentrouter',
+              balance: rec.balance,
+              balanceAt: rec.at,
+              updatedToday: new Date(rec.at + 8 * 3600e3).toISOString().slice(0, 10) === today,
+            }]
+          : [];
+        return json({ count: accounts.length, today, accounts });
       }
 
       // 平台命名空间：/trae/api/* → 模块内的 /api/*

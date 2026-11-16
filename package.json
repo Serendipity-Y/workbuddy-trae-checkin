@@ -1,0 +1,12 @@
+{
+  "name": "workbuddy-trae-checkin-local",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local (offline) deployment of the workbuddy-trae-checkin Cloudflare Worker",
+  "scripts": {
+    "start": "wrangler dev --ip 127.0.0.1 --port 8787"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,3 +1,121 @@
+# 自动签到与余额总览 · 增强版
+
+本项目基于 **[ggzhzc/workbuddy-trae-checkin](https://github.com/ggzhzc/workbuddy-trae-checkin)**，在原作者的 Trae / WorkBuddy / Qoder 自动签到工具上新增了一些功能。原始签到、扫码登录、通知、加密存储及控制台主体由上游提供，感谢原作者 **[ggzhzc](https://github.com/ggzhzc)** 的分享。
+
+此仓库保留上游提交历史和原有说明。以下先介绍本分支新增的余额查询、总览页面、AgentRouter 余额接入及本地部署文件；后文为上游用法说明，并对本分支的入口和余额含义作了必要更新。
+
+> **许可状态**：截至 2026-11-16，上游仓库未提供 LICENSE 或明确的开源许可声明。本分支未擅自为上游代码添加 MIT、Apache 等许可证；公开 fork 不代表获得任意再分发或商用授权。后续许可安排以原作者明确授权为准。参见 [GitHub 对仓库许可的说明](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository)。
+
+## 本分支新增了什么
+
+| 功能 | 上游提供的能力 | 本分支的增量 |
+| --- | --- | --- |
+| 余额查询 | Trae 已有余额；WorkBuddy 展示连签和累计；Qoder 记录领取量 | 增加 WorkBuddy、Qoder 的剩余余额查询，并保存最近查询时间 |
+| 默认主页 | 三平台完整签到控制台 | `/`、`/index.html` 改为余额总览；完整控制台移至 `/console`，两页可互相跳转 |
+| AgentRouter | 没有余额接入 | 增加余额推送与读取 API、总览显示，以及控制台第四个只读标签页 |
+| 本地运行 | 单文件 Worker，可云端部署 | 增加 Wrangler 配置、依赖锁文件、密钥模板和 Windows 启停/计划任务脚本 |
+| 交接与部署 | 上游 README | 增加 [AI 部署说明](DEPLOY-WITH-AI.md) 和 [项目交接文档](HANDOVER.md) |
+
+### 1. WorkBuddy 与 Qoder 剩余余额
+
+余额与“本次签到到账”“本工具累计领取”是不同指标：余额表示平台接口报告的可用额度，累计领取只表示本工具记下的领取总量，不会因后续消费而自动扣减。
+
+| 平台 | 查询方式与取值 | 列表 API 字段 |
+| --- | --- | --- |
+| Trae（沿用上游） | `creditsOf` 查询 `usage_summary`，并以 `entitlement` 兜底 | `credits` |
+| WorkBuddy（新增） | `POST https://copilot.tencent.com/billing/meter/get-user-resource-summary`，读取 `data.TotalCredits`；路径没有 `/v2` 前缀 | `balance`、`balanceAt` |
+| Qoder 国内版（新增） | `GET https://openapi.qoder.com.cn/api/v2/quota/usage`，将 `userQuota.remaining` 与 `addOnQuota.remaining` 相加 | `balance`、`balanceAt` |
+
+WorkBuddy、Qoder 在账号签到流程中查询余额，并随账号记录加密保存到 KV。余额请求异常不会中断原有签到流程；此前保存的余额可能继续显示，`balanceAt` 是最近一次成功查询所记录的时间（Unix 毫秒），列表中的余额保留两位小数；没有数据时为 `null`，页面显示 `—`。WorkBuddy 列表同时补充 `today`、`signedToday`、`ranToday`，便于总览按北京时间展示状态。
+
+**更新时机**：打开页面只读取 KV 中已存数据，不会逐个访问平台或额外轮换令牌。非强制运行可能跳过当天已完成的账号，此时也不会重新查询其余额。Qoder 当前在领取活动之前查询余额，所以本轮刚领到的额度可能要到下次实际运行才体现在余额中。
+
+### 2. 独立的余额总览主页
+
+- `/`、`/index.html`：按账号显示平台、账号备注、剩余余额和今日状态，支持 Trae、WorkBuddy、Qoder，以及已推送数据的 AgentRouter。
+- `/console`：保留原有完整控制台，用于扫码绑定、账号管理、手动签到及通知设置，并增加 AgentRouter 标签页。
+- 两个页面共用控制台样式和管理员登录凭证，业务数据接口需要 `X-Admin-Token`；未登录时可打开登录页面，不能读取账号列表。
+- 行数由已绑定账号及余额记录决定；未绑定的平台不会固定显示空行。
+
+主页的 **“刷新余额”会主动重跑三平台签到**（`POST /api/run-all?force=1`），然后重新读取列表，不是单纯刷新页面。它还会尝试请求同一主机的 `http://<主机名>:8788/refresh`，用于连接外部 AgentRouter 工具；该服务不包含在本仓库中。未部署该服务或浏览器阻止此跨域/混合内容请求时，不能由此刷新 AgentRouter 数据。
+
+### 3. AgentRouter 外部余额接入
+
+本分支只提供 **接收余额、保存快照和显示结果**，不包含 AgentRouter 登录、自动签到脚本或 `8788` 刷新服务。外部工具取得余额后，使用管理员口令推送到 Worker：
+
+```bash
+# 先在本机配置 CHECKIN_URL 与 ADMIN_TOKEN，避免把真实口令写入仓库。
+curl -X POST "$CHECKIN_URL/agentrouter/api/balance" \
+  -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"label":"示例账号","balance":25.5}'
+
+curl "$CHECKIN_URL/agentrouter/api/list" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+| 接口 | 行为 |
+| --- | --- |
+| `POST /agentrouter/api/balance` | 接收 `label` 和数值 `balance`；服务端生成时间 `at`，保存到 KV 的 `agentrouter:balance` |
+| `GET /agentrouter/api/list` | 返回 `{count, today, accounts}`；每个账号对象含 `label`、`balance`、`balanceAt`、`updatedToday` |
+
+读取结果示例（以下日期和余额仅为说明格式）：
+
+```json
+{
+  "count": 1,
+  "today": "2026-11-16",
+  "accounts": [
+    {
+      "label": "示例账号",
+      "balance": 25.5,
+      "balanceAt": 1794787200000,
+      "updatedToday": true
+    }
+  ]
+}
+```
+
+- 当前只保存 **一个余额快照**，每次推送覆盖上一次；这不是多账号数据库。
+- `label` 最多保留 40 个字符；空备注在读取时显示 `agentrouter`。余额应由调用方传入明确的 JSON 数值，接口拒绝转换后非有限的数值。
+- `updatedToday` 按北京时间判断“今天是否推送过”，不证明今天已完成签到；页面将它显示为“已更新”。
+- 页面按美元符号和两位小数显示 AgentRouter 余额；快照没有账号令牌，也不会触发平台登录。
+- 控制台内提及的 `AgentRouter-CheckIn` 任务、时间和奖励来自原本的本机配套环境，不会由本仓库自动创建，也不保证任何平台当前仍发放相同奖励。
+
+### 4. 本地部署与 Windows 便捷脚本
+
+云端仍可按后文方式部署。Windows、macOS、Linux 的通用本地启动方式如下；当前锁文件中的 Wrangler 要求 **Node.js 22+**：
+
+```bash
+git clone https://github.com/Serendipity-Y/workbuddy-trae-checkin.git
+cd workbuddy-trae-checkin
+npm ci
+# 复制 .dev.vars.example 为 .dev.vars，填写 MASTER_KEY、ADMIN_TOKEN，按需填写 CRON_SECRET。
+npm start
+```
+
+访问 `http://127.0.0.1:8787/` 查看余额总览，访问 `/console` 绑定账号。`MASTER_KEY` 必须备份，丢失后无法解密已保存的令牌；不要提交 `.dev.vars`、`.wrangler/` 或日志。
+
+| 文件 | 用途 |
+| --- | --- |
+| `wrangler.jsonc` | Worker 入口、`KV` 绑定和云端 Cron 配置；本地可使用占位 KV ID，云端需替换为自己的命名空间 ID |
+| `.dev.vars.example` | 只含空值的密钥模板 |
+| `start.cmd` / `service.cmd` | Windows 前台启动与后台服务入口，后者将输出写入 `service.log` |
+| `start-hidden.vbs` | 隐藏启动后台服务 |
+| `stop.cmd` / `stop.ps1` | 按当前项目路径匹配并停止其 Node/workerd 进程 |
+| `run-cron.cmd` | 检查本地服务是否可达，必要时启动，再携带口令调用 `/cron`；记录到 `cron.log` |
+| `setup-tasks.ps1` | 注册登录启动服务，以及每天本机时间 10:00、11:00 的签到任务；再次执行会覆盖同名任务 |
+
+**监听范围**：`npm start` 只监听 `127.0.0.1`；现有 Windows `start.cmd`、`service.cmd` 监听 `0.0.0.0:8787`，可能允许局域网访问。选择脚本运行时应配合防火墙或私有网络限制访问，不要直接把管理端口暴露到公网。
+
+**定时区别**：Wrangler 本地模拟服务本身不等于已安装每天运行的调度任务。Windows 可用 `setup-tasks.ps1` 配置；macOS/Linux 需自行配置调度。云端配置目前仍为上游的 `10 0 * * *`（北京时间 08:10）；如果 Qoder 活动在北京时间 10:00 后才开放，需自行增加例如 `20 2 * * *`（10:20）的补跑。
+
+**兼容与范围**：保留原来的三平台签到流程、KV 前缀和加密方案；余额功能是附加查询。原有截图来自上游，展示的是原版界面，未覆盖本分支总览和 AgentRouter 标签页。各平台接口可能随版本变化，本文说明代码当前行为，不保证真实平台随时可用。
+
+---
+
+## 原项目使用说明（保留并适配本分支入口）
+
 # Trae + WorkBuddy + Qoder 每日签到 · Cloudflare Worker
 
 把三个平台的每日签到搬到云端：**不用开电脑、不用装客户端、不用守时间**。各登录一次把账号托管进去，之后 Worker 自己续期令牌、按时签到。
@@ -42,7 +160,7 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 
 ## 二、添加账号
 
-打开 `https://signin-all.<你的子域>.workers.dev`，输入 `ADMIN_TOKEN` 登录，然后按平台添加。
+打开 `https://signin-all.<你的子域>.workers.dev/console`，输入 `ADMIN_TOKEN` 登录，然后按平台添加。
 
 ### Trae：抖音扫码
 
@@ -82,7 +200,7 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 
 > 备注名优先取账号昵称，取不到时是 `Trae-xxxx` 这类占位名。点名字或右边的铅笔可以就地改名。
 >
-> 「累计」是本工具自己记的领取量，不是官网余额（这些接口不返回余额）。
+> 「累计」是本工具自己记的领取量；本分支新增的剩余余额见主页「签到总览」，两者口径不同。
 
 ---
 
