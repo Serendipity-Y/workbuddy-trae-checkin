@@ -7,3 +7,9 @@ node_modules/
 CREDENTIALS.txt
 *.log
 .DS_Store
+
+__pycache__/
+*.pyc
+
+# Local mail settings can contain personal addresses and encrypted credentials.
+mail.config.json

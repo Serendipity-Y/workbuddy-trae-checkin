@@ -12,14 +12,14 @@ $svcSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIf
 Register-ScheduledTask -TaskName 'WorkBuddyCheckin-Service' -Action $svcAction -Trigger $svcTrigger -Settings $svcSettings -Principal $principal -Force | Out-Null
 Write-Host 'registered: WorkBuddyCheckin-Service (at logon)'
 
-# 2) Daily check-in at 10:00 (Qoder claim window opens ~10:00) + 11:00 backup.
+# 2) Daily check-in at 10:00 (Qoder claim window opens ~10:00) + 12:00 compensation.
 $cronAction = New-ScheduledTaskAction -Execute ($dir + '\run-cron.cmd') -WorkingDirectory $dir
 $cronTrigger = @(
   (New-ScheduledTaskTrigger -Daily -At '10:00'),
-  (New-ScheduledTaskTrigger -Daily -At '11:00')
+  (New-ScheduledTaskTrigger -Daily -At '12:00')
 )
 $cronSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
 Register-ScheduledTask -TaskName 'WorkBuddyCheckin-Daily' -Action $cronAction -Trigger $cronTrigger -Settings $cronSettings -Principal $principal -Force | Out-Null
-Write-Host 'registered: WorkBuddyCheckin-Daily (daily 10:00 + 11:00 backup)'
+Write-Host 'registered: WorkBuddyCheckin-Daily (daily 10:00 + 12:00 compensation)'
 
 Get-ScheduledTask -TaskName 'WorkBuddyCheckin-*' | Select-Object TaskName, State | Format-Table

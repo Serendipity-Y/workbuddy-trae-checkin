@@ -1,0 +1,194 @@
+LAST_RESULT = {}
+
+
+def _policy_day():
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).date().isoformat()
+
+
+def _receipt_path():
+    return os.path.join(HERE, 'last_result.json')
+
+
+def save_local_receipt(label, checked_in, balance, at):
+    payload = {
+        'label': label,
+        'date': _policy_day(),
+        'at': int(at),
+        'checkedIn': checked_in is True,
+        'balance': round(float(balance), 2),
+        'pushed': False,
+    }
+    temporary = _receipt_path() + '.tmp'
+    with open(temporary, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle)
+    os.replace(temporary, _receipt_path())
+    return payload
+
+
+def mark_receipt_pushed(label):
+    try:
+        with open(_receipt_path(), encoding='utf-8') as handle:
+            payload = json.load(handle)
+        if payload.get('label') != label or payload.get('date') != _policy_day():
+            return
+        payload['pushed'] = True
+        with open(_receipt_path(), 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle)
+    except Exception:
+        pass
+
+
+def load_local_receipt(label):
+    try:
+        with open(_receipt_path(), encoding='utf-8') as handle:
+            payload = json.load(handle)
+        if payload.get('label') != label or payload.get('date') != _policy_day():
+            return None
+        if payload.get('checkedIn') is not True:
+            return None
+        if isinstance(payload.get('balance'), bool) or not isinstance(payload.get('balance'), (int, float)):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def sync_local_receipt(label):
+    """Only re-push a matching same-day receipt; never log in to the platform."""
+    receipt = load_local_receipt(label)
+    if not receipt:
+        print_log('[INFO] no matching local receipt; nothing to sync')
+        return 1
+    if not push_balance(label, receipt['balance'], None, checkin_confirmed=True, balance_at=receipt['at']):
+        print_log('[FAIL] local receipt sync failed; no platform login was made')
+        return 1
+    mark_receipt_pushed(label)
+    print_log('[OK] local receipt synced without platform login')
+    return 0
+
+
+def request_daily_action(label):
+    settings = _worker_settings()
+    if not settings:
+        print_log('[FAIL] local Worker unavailable; no platform request will be made')
+        return {'ok': False, 'action': 'none'}
+    base, headers = settings
+    try:
+        with httpx.Client(timeout=10.0, trust_env=False) as client:
+            response = client.post(base.rstrip('/') + '/agentrouter/api/permit', headers=headers, json={'label': label})
+            payload = response.json()
+            if response.status_code != 200 or payload.get('ok') is not True:
+                return {'ok': False, 'action': 'none'}
+            action = payload.get('action')
+            if action not in ('run', 'sync', 'none'):
+                action = 'run' if payload.get('allowed') is True else 'none'
+            return {'ok': True, 'action': action, 'reason': payload.get('reason')}
+    except Exception:
+        return {'ok': False, 'action': 'none'}
+
+
+def report_outcome(label):
+    settings = _worker_settings()
+    if not settings:
+        return
+    base, headers = settings
+    outcome = LAST_RESULT.get('outcome')
+    if not outcome:
+        outcome = 'uncertain' if LAST_RESULT.get('login') else 'transient'
+    try:
+        with httpx.Client(timeout=10.0, trust_env=False) as client:
+            client.post(base.rstrip('/') + '/agentrouter/api/attempt', headers=headers, json={
+                'label': label,
+                'outcome': outcome,
+            })
+    except Exception:
+        pass
+
+
+def reconcile_cached_receipt():
+    """Only local cache and logs; never log in to the platform for migration."""
+    settings = _worker_settings()
+    if not settings:
+        return 1
+    base, headers = settings
+    try:
+        with httpx.Client(timeout=10.0, trust_env=False) as client:
+            response = client.get(base.rstrip('/') + '/agentrouter/api/list', headers=headers)
+            if response.status_code != 200:
+                return 1
+            rows = response.json().get('accounts') or []
+        if len(rows) != 1:
+            print('No single cached account to reconcile; check-in remains unconfirmed')
+            return 0
+        row = rows[0]
+        if row.get('signedToday') is True:
+            return 0
+        matched = historical_receipt(LOG_PATH, row)
+        if not matched:
+            if historical_attempt_today(LOG_PATH):
+                request_daily_action(row['label'])  # Consume today's legacy attempt without logging in again.
+            print('No matching same-day login receipt; check-in remains unconfirmed')
+            return 0
+        with httpx.Client(timeout=10.0, trust_env=False) as client:
+            response = client.post(base.rstrip('/') + '/agentrouter/api/balance', headers=headers, json={
+                'label': row['label'], 'balance': row['balance'], 'balanceAt': row['balanceAt'],
+                'checkin': {'confirmed': True, 'date': _policy_day(), 'source': 'login_response.checked_in', 'observedAt': matched},
+            })
+            if response.status_code != 200 or response.json().get('ok') is not True:
+                return 1
+        print('Reconciled a matching historical login receipt without any platform requests')
+        return 0
+    except Exception as error:
+        print('Local receipt reconciliation failed: ' + type(error).__name__)
+        return 1
+
+
+def historical_receipt(log_path, row):
+    """Require a matching login -> checked_in=True -> quota -> acknowledged push."""
+    import re
+    timezone = datetime.timezone(datetime.timedelta(hours=8))
+    today = _policy_day()
+    login_ok = checked = False
+    balance = None
+    for line in open(log_path, encoding='utf-8', errors='replace'):
+        match = re.match(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (.*)$', line)
+        if not match or not match[1].startswith(today):
+            continue
+        message = match[2]
+        if 'login HTTP' in message:
+            login_ok = message == 'login HTTP 200'
+            checked = False
+            balance = None
+        elif '[OK] login success, checked_in=' in message:
+            checked = login_ok and message.endswith('checked_in=True')
+        elif message.startswith('balance=$'):
+            amount = re.match(r'balance=\$(-?[0-9]+(?:\.[0-9]+)?)', message)
+            balance = float(amount[1]) if amount else None
+        elif message in ('push-balance: HTTP 200', 'push-balance: acknowledged HTTP 200'):
+            at = datetime.datetime.strptime(match[1], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone).timestamp() * 1000
+            if checked and balance is not None and abs(balance - row['balance']) < 0.005 and abs(at - row['balanceAt']) <= 2000:
+                return int(at)
+        elif '[FAIL]' in message or 'Traceback' in message:
+            login_ok = checked = False
+    return None
+
+
+def historical_attempt_today(log_path):
+    prefix = '[' + _policy_day()
+    with open(log_path, encoding='utf-8', errors='replace') as stream:
+        return any(line.startswith(prefix) and ('login HTTP' in line or 'attempt 1/' in line or 'all attempts failed' in line) for line in stream)
+
+
+def _block_response(response, label):
+    content_type = getattr(response, 'headers', {}).get('content-type', '').lower()
+    if response.status_code not in (401, 403, 429) and 'text/html' not in content_type:
+        return
+    settings = _worker_settings()
+    if not settings:
+        return
+    base, headers = settings
+    try:
+        with httpx.Client(timeout=10.0, trust_env=False) as client:
+            client.post(base.rstrip('/') + '/agentrouter/api/permit', headers=headers, json={'label':label,'blocked':True})
+    except Exception:
+        pass  # Today's permit was already consumed; do not retry a platform request.

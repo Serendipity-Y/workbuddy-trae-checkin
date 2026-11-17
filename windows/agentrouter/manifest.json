@@ -1,0 +1,73 @@
+{
+  "Version": "2026-11-17.3",
+  "Baseline": {
+    "Worker": [
+      "5b0fb4e85d97c2d90a7ba463a1f33ece3afd5c5b8045b3665bbe057ea9dab3ff",
+      "4721b7fe61135374ff96c61d52584740c17a854e09a248625e5b168ad9a394a2",
+      "c0d6a041ba350c07f6c897cdf8342f1a67c749f50cfd06a889f427158bf79140",
+      "2d468f0bc62471091a191498b2349b167ab75a1af7d2ed1136af000ed658d77c",
+      "57ef5f8d1742eaee9ba1534820a060e3cd90f7598669c96a7cadfbfbd542d684"
+    ],
+    "Helper": [
+      "7170304b71ed8bd0f7c4c5cd6bd1b2e2344c8835a9c28872cc2a0ab4b8d2f67a",
+      "beb1e805fd193a22f91e235c3c78584dbc16cc9bf23e058d7a2da3f2defe7104",
+      "655ee1a473afad678ba1b1cb75dda0f335082abc29dfe62d4744a102451dbecd",
+      "9b0814fa448b23c2422162da7c51334a78cc86f688f1fe9ce340c8d5414b247a"
+    ],
+    "Run": [
+      "42d68d7e1481bedbe84abb0b9a0491098274e830dbbcf28c5dba049f4ce39eba",
+      "eb2690270cba215c8da8aadea278f9c7db01502ef62939d0c33939c88bda8455"
+    ]
+  },
+  "Files": [
+    {
+      "Path": "worker.js",
+      "SHA256": "2d468f0bc62471091a191498b2349b167ab75a1af7d2ed1136af000ed658d77c"
+    },
+    {
+      "Path": "windows/agentrouter/helper.mjs",
+      "SHA256": "655ee1a473afad678ba1b1cb75dda0f335082abc29dfe62d4744a102451dbecd"
+    },
+    {
+      "Path": "windows/agentrouter/patch_login.py",
+      "SHA256": "f148c750f1fb284d049ce9844d666b2e436057bdf83abaa2eab525379583fd4d"
+    },
+    {
+      "Path": "windows/agentrouter/run-checkin.cmd",
+      "SHA256": "eb2690270cba215c8da8aadea278f9c7db01502ef62939d0c33939c88bda8455"
+    },
+    {
+      "Path": "tests/login_patch.py",
+      "SHA256": "b8e503a234568bf1e0867e6a3e770843d26c6a3f768a7c22d05724c2f3f06105"
+    },
+    {
+      "Path": "tests/fixtures/login_checkin.py",
+      "SHA256": "cd6c24d4657ec69d0970c257d58692d7cef9d6c74dcb2e517ea62b3a452968d8"
+    },
+    {
+      "Path": "windows/agentrouter/conservative_template.py.txt",
+      "SHA256": "03cfd4d93fc9b95ff7285d3933c19122e1e79ac9eb97ec7d1f703f1447395436"
+    },
+    {
+      "Path": "tests/dashboard.mjs",
+      "SHA256": "9ccb099a5de7b1faad75f05bb4099f4c2be2ae1f344cf8a92b1a704bd047fa2a"
+    },
+    {
+      "Path": "tests/helper.mjs",
+      "SHA256": "2c2b3fed85a4ac4553cbf989c5a631de1304e0071c7bb0489aab8fe5d5a2192f"
+    },
+    {
+      "Path": "tests/platforms.mjs",
+      "SHA256": "3ce3ecc01c205ba250ca149ff2cc695245761614f325e09298beb139eee54e85"
+    },
+    {
+      "Path": "tests/worker_policy.mjs",
+      "SHA256": "9d79c8e836510e0c8dcb68e85d0867081faf7ada660da9a5cca5a0a11e39db8f"
+    },
+    {
+      "Path": "tests/manifest.py",
+      "SHA256": "82eb21a8627761e12727faae2cdd165d6849749b8a9ea7f615f507f305c2b8d9"
+    }
+  ],
+  "HashFormat": "SHA256 of UTF-8 text, CRLF normalized to LF, final line endings omitted"
+}

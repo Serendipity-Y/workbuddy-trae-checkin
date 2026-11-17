@@ -1,0 +1,9 @@
+# Conservative execution and truthful platform counts
+
+The user selected automatic execution with at most one workflow per account per Beijing day, no automatic retries, and cache-only page reads. This reduces request frequency; it is not an assurance against platform terms enforcement.
+
+1. Centralize registered platform metadata for API routes, scheduled modules, both pages and progress. Count registered platforms; a platform completes only if every configured account has an explicit same-day success. Show account totals separately in explanatory text.
+2. Keep page reads local; make refresh buttons read caches only, remove frequent timers and force reruns. Guard every account workflow persistently before external calls and block authentication/risk failures. Preserve valid token rotation writes. Add at most one noon compensation for a clearly transient failure; verify uncertain outcomes read-only before any resubmission.
+3. Add explicit AgentRouter check-in receipts; never infer completion from balanceAt. The Windows runner requests a one-per-day action from the local Worker before contacting the platform, uses one login attempt, and persists a local receipt before pushing. A noon sync may re-push that receipt without logging in; only a reported transient failure permits one compensated login. Preserve the OS lock.
+4. Reconcile existing AgentRouter completion only from a matching login checked_in=True, balance and acknowledged push log sequence. Preserve the original balance timestamp. Do not call any platform just to make the counter 4/4.
+5. Test four/five providers, multiple accounts, missing/old proof, blocked/failed outcomes, concurrent calls and repeated daily tasks with network fixtures. Update a guarded installer with recognized version baselines and apply it on Windows. Acceptance uses only local status/cache endpoints and offline checks.

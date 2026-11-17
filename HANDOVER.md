@@ -12,7 +12,7 @@
 - 单文件 Worker：`worker.js`，标准 `export default { fetch, scheduled }`，**无构建、无第三方运行时依赖**（只用到 Web 标准 API：`fetch`、`crypto.subtle`、`TextEncoder`、`URL`、`Response` 等）。
 - 运行方式有两种：
   - **本地模拟**：`wrangler dev`（workerd），KV 落在本地 `.wrangler/state`。
-  - **云端**：部署到 Cloudflare Workers + KV，Cron `10 0 * * *`。
+  - **云端**：部署到 Cloudflare Workers + KV，Cron `20 2 * * *`（北京 10:20 主签到）+ `0 4 * * *`（北京 12:00 受限补偿）。
 - `package.json` 只有 devDependency `wrangler`；`wrangler.jsonc` 里 KV 绑定名必须叫 `KV`。
 
 ### 2. 代码地图（按功能，不依赖行号）
@@ -46,10 +46,11 @@
 - 余额在每次签到运行时抓取并写入账号记录（`balance` / `balanceAt` 或 `credits`），列表接口透出；仪表盘与 `/console` 的 AgentRouter 标签据此展示。**不要**在每次打开页面时重新抓余额（会触发令牌轮换与额外请求）。
 
 ### 6. 定时、幂等与 force
-- 计划任务建议：登录自启 + 每天 10:00 主签到 + 11:00 备份（Qoder 领取窗口约 10:00 开启）。
-- `/cron` 走 `force=false`：账号当天已成功或处于冷却期会跳过；`/api/run-all?force=1` 强制重跑。
-- 各平台签到接口幂等，重复跑不会重复加分。
-- 注意 Qoder 的 `already`（活动已是 CLAIMED）**不应**当作"今天已完成"而跳过——官方可能在 10:00 后补发新活动。
+- 计划任务：登录自启 + 每天 10:00 主签到 + 12:00 受限补偿（Qoder 领取窗口约 10:00 开启）。Cloudflare Cron 对应 `20 2 * * *`（北京 10:20）与 `0 4 * * *`（北京 12:00）。
+- `/cron` 在 12:00 前走主流程，12:00 后走 `compensate`；账号当天已成功或处于冷却期会跳过。`/api/run-all?force=1` 不能绕过当日尝试，也不触发补偿。
+- 补偿按结果分类：`transient` 可直接补一次；`uncertain` 先只读核对，确认未签才补；风控/验证码/限流/令牌失效停止。提交后 HTTP 5xx 的分类存在重复提交风险，详见 `CHANGELOG.md`。
+- 各平台签到接口幂等，但补偿仍限制为每账号每天最多一次。
+- 注意 Qoder 的 `already`（活动已是 CLAIMED）**不应**当作"今天已完成"而跳过——官方可能在 10:00 后补发新活动。当前用 `wait` 等状态表达，并在中午只读核对一次。
 
 ### 7. 部署
 - 本地：`npm install` → 复制 `.dev.vars.example` 为 `.dev.vars` 并填 `MASTER_KEY`/`ADMIN_TOKEN`(/`CRON_SECRET`) → `npx wrangler dev --ip 127.0.0.1 --port 8787`。
@@ -70,12 +71,24 @@
 
 升级上游或重构时，请保留以上行为与接口契约（尤其 `agentrouter:balance` 的字段、`/agentrouter/api/list` 的返回结构）。
 
+### 9.1 AgentRouter 可靠性修复（2026-11-17）
+- 总览每 30 秒及重新激活时只读 KV；各平台独立读取，显示余额实际采集时间及错误，请求有超时。
+- `windows/agentrouter/` 提供 helper、原有 Python 的定点修补工具和验证；helper 与计划任务复用同一执行入口；页面刷新只读缓存。缺余额/推送失败不能返回成功，零余额有效，OS 文件锁防止并发登录。
+- `repair-agentrouter.ps1` 针对已核对的 Windows 目录安装，校验输入/原文件、备份、替换后检查，仅重启目标 helper，并提供限定文件范围的回滚。配置和密钥不被替换。详见 `windows/agentrouter/README.md`。
+
+### 9.2 中午受限补偿（2026-11-17.3）
+- 主签到仍为每账号每天最多一轮；失败当天不自动重试。12:00 后 `/cron` 以 `compensate` 模式运行，只对 `transient`（普通网络/服务端暂时失败）允许一次。
+- Trae 用 `checkin_credits/status`、WorkBuddy 用 `checkin-activity-status`、Qoder 用活动列表做只读核对；`uncertain` 结果先核对，确认已签则本地补记，确认未签才补一次，核对不可用则停止。
+- AgentRouter 的 `/agentrouter/api/permit` 返回 `run` / `sync` / `none`；Python 通过 `/agentrouter/api/attempt` 上报 `transient|uncertain|rejected|blocked|success|success_unsynced`。登录成功但推送失败时写本机 `last_result.json`，中午只补推送，不重新登录。
+- Windows 安装脚本默认将 `AgentRouter-CheckIn` 和 `WorkBuddyCheckin-Daily` 的第二个触发时间设为 12:00。若手动设置错峰，以本机任务计划为准；再次运行安装脚本可能恢复默认时间。修复脚本保存原始任务 XML，回滚时一并恢复。
+
 ### 10. 验证清单（改完必跑）
 1. `curl -s http://127.0.0.1:8787/` 含「签到总览」。
 2. `curl -s -H "X-Admin-Token: <token>" http://127.0.0.1:8787/api/ping` → `{"ok":true}`。
 3. 三个 `/<p>/api/list` 正常返回；`/agentrouter/api/list` 返回推送的余额。
-4. `POST /cron`（带上口令）返回三平台 summary，`failed` 为 0。
+4. `POST /cron`（带上口令）返回三平台 summary，`failed` 为 0；12:00 后返回 `mode: "compensate"`，已成功账号不产生平台请求。
 5. 浏览器：`/` 仪表盘四行（含 AgentRouter）、`/console` 四个标签页、`余额总览`↔`完整控制台` 互跳正常。
+6. 补偿演练（离线）：构造 `lastAttemptOutcome` 为 `transient` / `uncertain` / `blocked` 的账号，确认 `transient` 最多补一次，`uncertain` 必须核对，`blocked` 停止。
 
 ### 11. 已知限制 / 易踩坑
 - 三个平台的接口均为逆向，客户端/官网升级可能失效，需按新抓包调整常量与路径。
@@ -103,3 +116,24 @@
 ## 提示词正文结束
 
 把上面内容整段发给接手方即可。维护时请同步更新本文件与 `DEPLOY-WITH-AI.md`。
+
+### 2026-11-17.2 保守模式与统计
+- 以 `docs/risk-evidence-2026-11-17.md` 的证据和适用范围为准；每天最多一轮是用户选择的减量策略，不是官方安全阈值。
+- `PLATFORMS` 是平台清单的唯一来源，`/api/platforms` 提供发现，`/api/summary` 从本地缓存生成平台完成数。未来平台实现必须复用每日工作流保护及缓存列表/确认回执契约。
+- 页面“刷新列表”不触发签到；重复执行和force参数不能绕过当日尝试。旧记录当天已执行过时也跳过，主流程失败不自动重试（.3 起仅增加中午一次受限补偿）。
+- AgentRouter 接收独立的签到确认，不再把updatedToday当作signedToday。迁移仅匹配本机既有日志及缓存，不发平台请求。
+
+### 2026-11-17.3 中午补偿
+- 主签到后中午增加一次受限补偿，所有状态持久化：`lastAttemptOutcome`、`compensationDate`。只有 `transient` 可直接补；`uncertain` 必须先只读核对，核对不可用或结果不明时停止。
+- `/api/platforms` 的 policy 增加 `noonCompensationsPerAccountPerDay: 1`；Dashboard meta 为 `daily-once-with-noon-compensation-2026-11-17.3`。
+- AgentRouter 的补偿动作由本地 Worker 决定：`run`、`sync`、`none`；Python 只执行返回的动作，不自行猜测。
+- 新增平台时需同时实现：主签到结果分类（至少 success/transient/uncertain/rejected/blocked）和可选的只读核对函数；否则不确定结果不会补跑。
+
+### 2026-11-17 运维增强：错峰、邮件提醒与基线自维护
+- 安装脚本默认触发时间：`AgentRouter-CheckIn` 10:20 + 12:00；`WorkBuddyCheckin-Daily` 10:00 + 12:00。实际任务可能经过手动调整，以本机任务计划为准；默认策略标记为 `daily-once-with-noon-compensation-2026-11-17.3`。
+- 可按需配置计划任务运行 `notify-daily.ps1`（例如每日 12:30）；该脚本读本机 `/api/summary`（`ADMIN_TOKEN` 取自 `.dev.vars`），发送 HTML 卡片邮件（`smtp.qq.com:587` STARTTLS）；4/4 主题为 `[签到完成]`，否则为 `[签到异常]` 并列出未完成平台。只读缓存，不产生平台请求。
+- 邮件凭据：`mail.config.json` 中为 Windows DPAPI 加密串，绑定当前用户；由 `setup-mail-config.ps1` 交互录入（`Read-Host -AsSecureString`），脚本不含地址与授权码。更换授权码后重跑该脚本即可。
+- `repair-agentrouter.ps1`：每次运行额外写 `agentrouter-repair-<时间戳>.log` 保留历史；安装成功后 `Update-Baseline` 把本次 Worker/Helper/Run 的归一化哈希追加进 `windows/agentrouter/manifest.json`，避免下一版因“基线漏收上一版产出”而中断。
+- manifest 中允许的旧版本基线应来自已核对的安装产物；部署前请结合本机备份中的 `manifest.json` 校验。
+- 环境注意：部分工具终端中的 PowerShell `Add-Content` 曾出现异常；邮件脚本使用 `[IO.File]::AppendAllText`，目标机器的运行效果应自行验证。
+- 邮件与任务回滚：如已创建 `Checkin-Daily-Email`，可用 `Unregister-ScheduledTask` 停止该任务；任务触发时间可由本次备份目录中的任务 XML 用 `Register-ScheduledTask -Xml` 还原。

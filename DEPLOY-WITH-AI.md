@@ -10,7 +10,7 @@
 
 项目根目录即当前目录，核心文件：
 - `worker.js`：全部后端逻辑（无构建、无依赖，标准 `export default { fetch, scheduled }`）。
-- `wrangler.jsonc`：本地/云端运行配置（KV 绑定名必须是 `KV`，cron `10 0 * * *`）。
+- `wrangler.jsonc`：本地/云端运行配置（KV 绑定名必须是 `KV`，cron `20 2 * * *` + `0 4 * * *`）。
 - `.dev.vars.example`：密钥模板；复制为 `.dev.vars` 后填写。
 - `package.json`：仅 devDependency `wrangler`。
 - `start.cmd` / `service.cmd` / `stop.cmd` / `run-cron.cmd` / `start-hidden.vbs` / `setup-tasks.ps1`：Windows 启动、停止、每日触发与计划任务脚本（路径无关，使用 `%~dp0` / `$PSScriptRoot`）。
@@ -19,7 +19,7 @@
 ### 目标
 1. 在本机用 Wrangler 本地模拟运行该 Worker（监听 `127.0.0.1:8787`）。
 2. 生成密钥、写入 `.dev.vars`，启动服务并在浏览器验证控制台。
-3. 配置 Windows 计划任务：登录自启 + 每天 10:00 主签到 + 11:00 备份。
+3. 配置 Windows 计划任务：登录自启 + 每天 10:00 主签到 + 12:00 受限补偿。
 4. 不把任何密钥提交进 git。
 
 ### 前置条件
@@ -64,7 +64,7 @@ npx wrangler dev --ip 127.0.0.1 --port 8787
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-tasks.ps1
 ```
-注册 `WorkBuddyCheckin-Service`（登录自启）与 `WorkBuddyCheckin-Daily`（每天 10:00 + 11:00）。`.\stop.cmd` 停止，`.\start.cmd` 前台调试。
+注册 `WorkBuddyCheckin-Service`（登录自启）与 `WorkBuddyCheckin-Daily`（每天 10:00 + 12:00 受限补偿）。`.\stop.cmd` 停止，`.\start.cmd` 前台调试。
 
 ### 路由与余额来源
 - `/`：签到总览仪表盘（表格：平台/账号/剩余余额/今日状态）。
@@ -92,3 +92,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-tasks.ps1
 ## 提示词正文结束
 
 把上面内容整段发给 AI 即可开始。
+
+## 已有 Windows AgentRouter 安装的修复
+
+若本机已经安装独立的 AgentRouter 登录脚本与 8788 helper，参见 [修复说明](windows/agentrouter/README.md)。修复工具会校验目标版本、保留配置、备份并验证四个目标文件与两个计划任务定义，提供回滚；它不是全新 AgentRouter 安装程序。
+
+保守版本 2026-11-17.3 的验收只使用离线测试、本机日志与缓存接口；不要为了验收调用四家平台或重新签到。`-VerifyRefresh` 不再触发真实平台请求。计划任务的第二个触发时间会调整为 12:00，原始任务 XML 保存在备份目录，回滚时一并恢复。

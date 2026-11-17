@@ -31,11 +31,11 @@
  *   /oauth/callback       Trae 扫码回调（授权链接里写死这个路径，必须在根）
  *
  * Cron 配置（Cloudflare 的 cron 走 UTC，比北京时间慢 8 小时）：
- *   北京 08:10 = UTC 00:10    crons = ["10 0 * * *"]
- *   北京 10:20 = UTC 02:20    crons = ["20 2 * * *"]   ← 给 Qoder 补的一轮
- * 第一轮把三个平台各跑一遍；Qoder 的活动每天 10:00 后才下发，
- * 所以第二轮专门兜它，前两个平台当天已签会自动跳过。
- * 签到本身是幂等的（今天签过就跳过），想多兜几次只是在数组里多加一条时间。
+ *   北京 10:20 = UTC 02:20    crons = ["20 2 * * *"]   主签到
+ *   北京 12:00 = UTC 04:00    crons = ["0 4 * * *"]    仅对可补签失败做一次核对/补偿
+ * 主签到每个账号只跑一轮；失败后当天不再自动重试。中午窗口只处理普通网络/服务端
+ * 暂时失败，先用只读状态接口核对，确认未签才补一次；风险、验证码、限流、认证
+ * 失效和结果不明确都不补跑。
  */
 
 
@@ -550,18 +550,55 @@ function cooldownMinutes() {
 /* 单个账号的完整签到流程                                               */
 /* ------------------------------------------------------------------ */
 
-async function signinOne(env, acct, { force = false } = {}) {
+async function signinOne(env, acct, { mode = 'run' } = {}) {
+  return conservativeSignin(acct, {
+    key: 'trae:' + acct.id,
+    mode,
+    save: () => putAccount(env, acct),
+    verify: () => verifyToday(env, acct),
+    run: () => signinOneInner(env, acct, { force: false }),
+  });
+}
+
+/** 只读核对：不提交签到，只回答 checked / not_signed / blocked / unknown */
+async function verifyToday(env, acct) {
+  const now = Date.now();
+  let token = String(acct.accessToken || '');
+  const exp = jwtExp(token);
+  if (!token || (exp && exp * 1000 - now <= 120000)) {
+    try {
+      const t = await refreshTokens(acct);
+      token = t.accessToken;
+      acct.accessToken = token;
+      acct.refreshToken = t.refreshToken;
+      acct.accessExp = jwtExp(token);
+      acct.tokenRefreshedAt = now;
+      await putAccount(env, acct);
+    } catch {
+      return { state: 'unknown' };
+    }
+  }
+  try {
+    const st = await statusOf(token, acct);
+    if (!st.ok) return { state: 'unknown' };
+    return { state: st.checked === true ? 'checked' : 'not_signed' };
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+
+async function signinOneInner(env, acct, { force = false } = {}) {
   const now = Date.now();
   const today = bjDay(now);
   const base = { id: acct.id, label: acct.label };
 
   if (!force && Number(acct.cooldownUntil || 0) > now) {
     const left = Math.ceil((acct.cooldownUntil - now) / 60000);
-    return { ...base, state: 'cooldown', msg: `限流冷却中，约 ${left} 分钟` };
+    return { ...base, state: 'cooldown', msg: `限流冷却中，约 ${left} 分钟`, outcome: 'blocked' };
   }
 
   if (!force && acct.lastOkDate === today) {
-    return { ...base, state: 'skipped', msg: '今日已完成' };
+    return { ...base, state: 'skipped', msg: '今日已完成', outcome: 'success' };
   }
 
   // 1) 拿一个可用的 accessToken：还没过期就直接用，避免无谓轮换
@@ -583,41 +620,32 @@ async function signinOne(env, acct, { force = false } = {}) {
       acct.lastMsg = e.message;
       acct.lastRun = now;
       await putAccount(env, acct);
-      return { ...base, state: 'token_dead', msg: e.message };
+      return { ...base, state: 'token_dead', msg: e.message, outcome: 'blocked' };
     }
   }
 
-  // 2) 提交签到（鉴权类错误刷新一次再试）
-  let res = await claim(token, acct);
-
-  if (AUTH_FAIL_CODES.includes(res.code)) {
-    try {
-      const t = await refreshTokens(acct);
-      token = t.accessToken;
-      acct.refreshToken = t.refreshToken;
-      acct.accessToken = token;
-      acct.accessExp = jwtExp(token);
-      await putAccount(env, acct);
-      res = await claim(token, acct);
-    } catch (e) {
-      acct.lastState = 'token_dead';
-      acct.lastMsg = e.message;
-      acct.lastRun = now;
-      await putAccount(env, acct);
-      return { ...base, state: 'token_dead', msg: e.message };
-    }
+  // Conservative mode: one claim request; no replay after an authentication failure.
+  const res = await claim(token, acct);
+  if (AUTH_FAIL_CODES.includes(res.code) || res.status === 401 || res.status === 403) {
+    acct.lastState = 'token_dead'; acct.lastMsg = '认证或风险限制，需要人工核查'; acct.lastRun = now;
+    await putAccount(env, acct);
+    return { ...base, state: 'token_dead', msg: acct.lastMsg, outcome: 'blocked' };
   }
 
   acct.lastRun = now;
 
   // 3) 限流：换个假设备号也没用，9074 会原样返回，按账号冷却等下轮
-  if (res.code === CODE_RATE || res.status === 429 || res.status >= 500) {
+  if (res.status >= 500) {
+    acct.lastState = 'error'; acct.lastMsg = '平台暂不可用 HTTP ' + res.status;
+    await putAccount(env,acct); return { ...base,state:'error',msg:acct.lastMsg,outcome:'transient' };
+  }
+  if (res.code === CODE_RATE || res.status === 429) {
     const mins = cooldownMinutes();
     acct.cooldownUntil = now + mins * 60000;
     acct.lastState = 'rate';
     acct.lastMsg = `限流 9074，冷却 ${mins} 分钟`;
     await putAccount(env, acct);
-    return { ...base, state: 'rate', msg: acct.lastMsg };
+    return { ...base, state: 'rate', msg: acct.lastMsg, outcome: 'blocked' };
   }
 
   // 4) 今日已签
@@ -632,7 +660,7 @@ async function signinOne(env, acct, { force = false } = {}) {
       acct.checkedIn = true;
     }
     await putAccount(env, acct);
-    return { ...base, state: 'already', msg: '今日已签', credits: acct.credits ?? null };
+    return { ...base, state: 'already', msg: '今日已签', credits: acct.credits ?? null, outcome: 'success' };
   }
 
   // 5) 其它失败
@@ -640,7 +668,7 @@ async function signinOne(env, acct, { force = false } = {}) {
     acct.lastState = 'error';
     acct.lastMsg = `签到失败 code=${res.code} ${res.msg ?? ''}`.trim();
     await putAccount(env, acct);
-    return { ...base, state: 'error', msg: acct.lastMsg };
+    return { ...base, state: 'error', msg: acct.lastMsg, outcome: 'rejected' };
   }
 
   // 6) code=0 未必真到账：用同一 deviceId 回查 checked_in 是否翻转
@@ -659,11 +687,11 @@ async function signinOne(env, acct, { force = false } = {}) {
   if (!confirmed) {
     const bal = await creditsOf(token, acct).catch(() => null);
     acct.lastState = 'pending';
-    acct.lastMsg = '已提交，但回查未确认，等下轮再试';
+    acct.lastMsg = '已提交，但回查未确认，等待中午只读核对';
     acct.credits = bal ?? credits ?? acct.credits ?? null;
     acct.cooldownUntil = now + 12 * 60000;
     await putAccount(env, acct);
-    return { ...base, state: 'pending', msg: acct.lastMsg, credits: acct.credits ?? null };
+    return { ...base, state: 'pending', msg: acct.lastMsg, credits: acct.credits ?? null, outcome: 'uncertain' };
   }
 
   const bal = await creditsOf(token, acct).catch(() => null);
@@ -684,6 +712,7 @@ async function signinOne(env, acct, { force = false } = {}) {
     msg: acct.lastMsg,
     credits: acct.credits ?? null,
     points: res.points ?? null,
+    outcome: 'success',
   };
 }
 
@@ -770,6 +799,8 @@ async function handleList(request, env) {
       lastMsg: a.lastMsg,
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
+      automationBlocked:a.automationBlocked===true,
+      conservativeAttemptDate:a.conservativeAttemptDate || null,
       lastCredit: a.lastCredit ?? null,
       credits: typeof a.credits === 'number' ? Math.round(a.credits * 100) / 100 : null,
       totalCredit: a.totalCredit ?? 0,
@@ -787,14 +818,14 @@ async function handleList(request, env) {
   return json({ count: out.length, today, accounts: out });
 }
 
-async function handleRun(request, env, force) {
+async function handleRun(request, env, force, mode = 'run') {
   const list = await listAccounts(env);
   const results = [];
   for (const meta of list) {
     const a = await getAccount(env, meta.id);
     if (!a) continue;
     try {
-      results.push(await signinOne(env, a, { force }));
+      results.push(await signinOne(env, a, { mode }));
     } catch (e) {
       results.push({ id: a.id, label: a.label, state: 'error', msg: e.message });
     }
@@ -1403,7 +1434,8 @@ const __mod = {
       if (path === '/api/rename' && method === 'POST') return handleRename(request, env);
       if (path === '/api/run' && method === 'POST') {
         const force = url.searchParams.get('force') === '1';
-        return handleRun(request, env, force);
+        const mode = url.searchParams.get('mode') === 'compensate' ? 'compensate' : 'run';
+        return handleRun(request, env, force, mode);
       }
 
       return json({ error: 'not found' }, 404);
@@ -1414,6 +1446,7 @@ const __mod = {
 
   /** Cloudflare Cron Trigger 到点自动跑 */
   async scheduled(event, env, ctx) {
+    const mode = event && event.mode === 'compensate' ? 'compensate' : 'run';
     ctx.waitUntil(
       (async () => {
         const list = await listAccounts(env);
@@ -1421,7 +1454,7 @@ const __mod = {
           const acct = await getAccount(env, meta.id);
           if (!acct) continue;
           try {
-            await signinOne(env, acct, { force: false });
+            await signinOne(env, acct, { mode });
           } catch {
             /* 单账号失败不影响其他账号 */
           }
@@ -1735,9 +1768,10 @@ async function resourceBalance(at) {
 }
 
 async function doCheckin(at) {
-  const { json } = await wbFetch('/v2/billing/meter/daily-checkin', {
+  const { status, json } = await wbFetch('/v2/billing/meter/daily-checkin', {
     headers: authHeader(at),
   });
+  if ([401,403,429].includes(status)) return {state:'error',code:status,msg:'HTTP '+status};
   if (json?.code === 0) {
     return { state: 'checked', credit: json.data?.credit ?? 100, raw: json.data };
   }
@@ -1751,29 +1785,69 @@ async function doCheckin(at) {
 /* 单个账号的完整签到流程                                               */
 /* ------------------------------------------------------------------ */
 
-async function signinOne(env, acct, { force = false } = {}) {
+async function signinOne(env, acct, { mode = 'run' } = {}) {
+  return conservativeSignin(acct, {
+    key: 'wb:' + acct.id,
+    mode,
+    save: () => putAccount(env, acct),
+    verify: () => verifyToday(env, acct),
+    run: () => signinOneInner(env, acct, { force: false }),
+  });
+}
+
+/** 只读核对：不提交签到，只回答 checked / not_signed / blocked / unknown */
+async function verifyToday(env, acct) {
+  let tokens;
+  try {
+    tokens = await refreshTokens(acct.refreshToken);
+  } catch (e) {
+    return { state: e.fatal ? 'blocked' : 'unknown' };
+  }
+  acct.refreshToken = tokens.refreshToken;
+  acct.accessToken = tokens.accessToken;
+  acct.accessExp = Date.now() + (Number(tokens.expiresIn) || 3600) * 1000;
+  acct.tokenRefreshedAt = Date.now();
+  await putAccount(env, acct);
+  try {
+    const st = await checkinStatus(tokens.accessToken);
+    if (!st.ok) return { state: 'unknown' };
+    return { state: st.data.checked_in_today === true ? 'checked' : 'not_signed' };
+  } catch {
+    return { state: 'unknown' };
+  }
+}
+
+async function signinOneInner(env, acct, { force = false } = {}) {
   const now = Date.now();
   const today = new Date(now + 8 * 3600 * 1000).toISOString().slice(0, 10); // 按北京时间算日期
 
   // 今天已成功过、且没要求强制，直接跳过（省一次请求，也避免无谓刷新）
   if (!force && acct.lastOkDate === today && acct.lastState !== 'error') {
-    return { id: acct.id, label: acct.label, state: 'skipped', msg: '今日已完成' };
+    return { id: acct.id, label: acct.label, state: 'skipped', msg: '今日已完成', outcome: 'success' };
   }
 
   let tokens;
-  try {
-    tokens = await refreshTokens(acct.refreshToken);
-  } catch (e) {
-    acct.lastState = e.fatal ? 'token_dead' : 'error';
-    acct.lastMsg = e.message;
-    acct.lastRun = now;
-    await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: acct.lastState, msg: e.message };
+  const cachedToken = String(acct.accessToken || '');
+  if (cachedToken && Number(acct.accessExp || 0) > now + 60000) {
+    tokens = { accessToken: cachedToken, refreshToken: acct.refreshToken };
+  } else {
+    try {
+      tokens = await refreshTokens(acct.refreshToken);
+    } catch (e) {
+      acct.lastState = e.fatal ? 'token_dead' : 'error';
+      acct.lastMsg = e.message;
+      acct.lastRun = now;
+      await putAccount(env, acct);
+      return { id: acct.id, label: acct.label, state: acct.lastState, msg: e.message, outcome: e.fatal ? 'blocked' : 'transient' };
+    }
   }
 
   // 先落盘新令牌。哪怕后面签到失败，令牌链也不能断。
   acct.refreshToken = tokens.refreshToken;
+  acct.accessToken = tokens.accessToken;
+  if (tokens.expiresIn) acct.accessExp = now + Number(tokens.expiresIn) * 1000;
   acct.tokenRefreshedAt = now;
+  await putAccount(env, acct);
 
   let result;
   try {
@@ -1783,7 +1857,12 @@ async function signinOne(env, acct, { force = false } = {}) {
     acct.lastMsg = `签到请求异常: ${e.message}`;
     acct.lastRun = now;
     await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: 'error', msg: acct.lastMsg };
+    return { id: acct.id, label: acct.label, state: 'error', msg: acct.lastMsg, outcome: 'uncertain' };
+  }
+
+  if ([401,403,429].includes(result.code)) {
+    acct.lastState=result.code===429?'rate':'token_dead';acct.lastMsg='平台限制 HTTP '+result.code+'，停止后续请求';acct.lastRun=now;
+    await putAccount(env,acct);return {id:acct.id,label:acct.label,state:acct.lastState,msg:acct.lastMsg,outcome:'blocked'};
   }
 
   let streak = null;
@@ -1837,6 +1916,7 @@ async function signinOne(env, acct, { force = false } = {}) {
     msg: acct.lastMsg,
     streak,
     total,
+    outcome: result.state === 'error' ? 'rejected' : 'success',
   };
 }
 
@@ -1929,6 +2009,8 @@ async function handleList(request, env) {
       lastMsg: a.lastMsg,
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
+      automationBlocked:a.automationBlocked===true,
+      conservativeAttemptDate:a.conservativeAttemptDate || null,
       today,
       signedToday: a.lastOkDate === today,
       ranToday: a.lastRun ? day(a.lastRun) === today : false,
@@ -1971,14 +2053,14 @@ async function handleRename(request, env) {
   return json({ ok: true, id, label });
 }
 
-async function handleRun(request, env, force) {
+async function handleRun(request, env, force, mode = 'run') {
   const list = await listAccounts(env);
   const results = [];
   for (const meta of list) {
     const a = await getAccount(env, meta.id);
     if (!a) continue;
     try {
-      results.push(await signinOne(env, a, { force }));
+      results.push(await signinOne(env, a, { mode }));
     } catch (e) {
       results.push({ id: a.id, label: a.label, state: 'error', msg: e.message });
     }
@@ -2032,7 +2114,8 @@ const __mod = {
       if (path === '/api/rename' && method === 'POST') return handleRename(request, env);
       if (path === '/api/run' && method === 'POST') {
         const force = url.searchParams.get('force') === '1';
-        return handleRun(request, env, force);
+        const mode = url.searchParams.get('mode') === 'compensate' ? 'compensate' : 'run';
+        return handleRun(request, env, force, mode);
       }
 
       return json({ error: 'not found' }, 404);
@@ -2043,6 +2126,7 @@ const __mod = {
 
   /** Cloudflare Cron Trigger 到点自动跑 */
   async scheduled(event, env, ctx) {
+    const mode = event && event.mode === 'compensate' ? 'compensate' : 'run';
     ctx.waitUntil(
       (async () => {
         const list = await listAccounts(env);
@@ -2050,7 +2134,7 @@ const __mod = {
           const acct = await getAccount(env, meta.id);
           if (!acct) continue;
           try {
-            await signinOne(env, acct, { force: false });
+            await signinOne(env, acct, { mode });
           } catch {
             /* 单账号失败不影响其他账号 */
           }
@@ -2560,38 +2644,78 @@ const bjHour = (ms = Date.now()) => new Date(ms + 8 * 3600e3).getUTCHours();
 /* 单个账号的完整签到流程                                               */
 /* ------------------------------------------------------------------ */
 
-async function signinOne(env, acct, { force = false } = {}) {
+async function signinOne(env, acct, { mode = 'run' } = {}) {
+  return conservativeSignin(acct, {
+    key: 'qoder:' + acct.id,
+    mode,
+    save: () => putAccount(env, acct),
+    verify: () => verifyToday(env, acct),
+    run: () => signinOneInner(env, acct, { force: false }),
+  });
+}
+
+/** 只读核对：不领取活动，只回答 checked / not_signed / blocked / unknown */
+async function verifyToday(env, acct) {
+  const now = Date.now();
+  let at = String(acct.accessToken || '');
+  try {
+    const claims = jwtClaims(at);
+    if (!at || (Number(claims.exp) > 0 && Number(claims.exp) * 1000 <= now)) {
+      at = await refreshAccount(acct);
+      await putAccount(env, acct);
+    }
+  } catch {
+    return { state: 'unknown' };
+  }
+  let list;
+  try {
+    list = await fetchCampaigns(at, acct, env);
+  } catch {
+    return { state: 'unknown' };
+  }
+  if (list.status === 401 || list.status === 403 || list.status === 429) return { state: 'blocked' };
+  if (list.status !== 200) return { state: 'unknown' };
+  const rows = campaignRows(list.json);
+  const target = rows
+    .filter((row) => row && isClaimable(row.claimStatus))
+    .sort((a, b) => actionRank(a.actionType) - actionRank(b.actionType))[0] || null;
+  if (target) return { state: 'not_signed' };
+  const claimed = rows.some((row) => row && isClaimedStatus(row.claimStatus));
+  const hasBenefitRow = rows.some((row) => /CLAIM_BENEFIT/i.test(String(row?.actionType || '')));
+  return { state: claimed && hasBenefitRow ? 'checked' : 'not_signed' };
+}
+
+async function signinOneInner(env, acct, { force = false } = {}) {
   const now = Date.now();
   const today = bjDay(now);
 
   // 只有「我们真的领到了」才允许当天跳过后续轮次；
   // already（活动本来就是 CLAIMED）不算，因为官方可能在 10:00 后才补发新活动，得让它再查一次。
   if (!force && acct.lastOkDate === today && acct.lastState === 'checked') {
-    return { id: acct.id, label: acct.label, state: 'skipped', msg: '今日已完成' };
+    return { id: acct.id, label: acct.label, state: 'skipped', msg: '今日已完成', outcome: 'success' };
   }
   if (!force && Number(acct.cooldownUntil || 0) > now) {
-    return { id: acct.id, label: acct.label, state: 'skipped', msg: '限流冷却中' };
+    return { id: acct.id, label: acct.label, state: 'skipped', msg: '限流冷却中', outcome: 'blocked' };
   }
 
   let at = String(acct.accessToken || '');
   let list;
   try {
-    if (!at) at = await refreshAccount(acct);
-    list = await fetchCampaigns(at, acct, env);
-    if ((list.status === 401 || list.status === 403) && acct.refreshToken) {
-      at = await refreshAccount(acct);
-      list = await fetchCampaigns(at, acct, env);
+    const claims = jwtClaims(at);
+    if (!at || (Number(claims.exp) > 0 && Number(claims.exp) * 1000 <= now)) {
+      at = await refreshAccount(acct); await putAccount(env, acct);
     }
+    list = await fetchCampaigns(at, acct, env);
   } catch (e) {
     acct.lastState = e.fatal ? 'token_dead' : 'error';
     acct.lastMsg = e.message;
     acct.lastRun = now;
     await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: acct.lastState, msg: e.message };
+    return { id: acct.id, label: acct.label, state: acct.lastState, msg: e.message, outcome: e.fatal ? 'blocked' : 'transient' };
   }
 
   try {
-    const bal = await quotaBalance(at, regionOf(acct.region));
+    const bal = list.status === 200 ? await quotaBalance(at, regionOf(acct.region)) : null;
     if (bal != null) {
       acct.balance = bal;
       acct.balanceAt = now;
@@ -2602,15 +2726,19 @@ async function signinOne(env, acct, { force = false } = {}) {
 
   // 用局部变量判断这次的结果，别沿用上一次运行留下的 lastState
   let failed = '';
+  let failedOutcome = '';
   if (list.status === 429) {
     acct.cooldownUntil = now + COOLDOWN_MIN * 60000;
     failed = 'error';
+    failedOutcome = 'blocked';
     acct.lastMsg = '请求过于频繁（HTTP 429），' + COOLDOWN_MIN + ' 分钟后重试';
   } else if (list.status === 401 || list.status === 403) {
     failed = 'token_dead';
+    failedOutcome = 'blocked';
     acct.lastMsg = '凭证已失效，请删掉这个账号重新添加';
   } else if (list.status !== 200) {
     failed = 'error';
+    failedOutcome = list.status >= 500 ? 'transient' : 'rejected';
     acct.lastMsg = '活动列表返回 HTTP ' + list.status;
   }
 
@@ -2618,7 +2746,7 @@ async function signinOne(env, acct, { force = false } = {}) {
     acct.lastState = failed;
     acct.lastRun = now;
     await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: failed, msg: acct.lastMsg };
+    return { id: acct.id, label: acct.label, state: failed, msg: acct.lastMsg, outcome: failedOutcome };
   }
 
   const rows = campaignRows(list.json);
@@ -2652,7 +2780,13 @@ async function signinOne(env, acct, { force = false } = {}) {
       acct.lastMsg = '没有可领取的活动 · ' + digest;
     }
     await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: acct.lastState, msg: acct.lastMsg };
+    return {
+      id: acct.id,
+      label: acct.label,
+      state: acct.lastState,
+      msg: acct.lastMsg,
+      outcome: acct.lastState === 'already' ? 'success' : 'transient',
+    };
   }
 
   const campaignId = String(target.campaignId || target.campaignKey || target.key || target.id || '').trim();
@@ -2660,7 +2794,7 @@ async function signinOne(env, acct, { force = false } = {}) {
     acct.lastState = 'error';
     acct.lastMsg = '活动数据里没有 campaignId，无法领取';
     await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: acct.lastState, msg: acct.lastMsg };
+    return { id: acct.id, label: acct.label, state: acct.lastState, msg: acct.lastMsg, outcome: 'rejected' };
   }
 
   let claim;
@@ -2670,16 +2804,18 @@ async function signinOne(env, acct, { force = false } = {}) {
     acct.lastState = 'error';
     acct.lastMsg = '领取请求异常：' + e.message;
     await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: acct.lastState, msg: acct.lastMsg };
+    return { id: acct.id, label: acct.label, state: acct.lastState, msg: acct.lastMsg, outcome: 'uncertain' };
   }
 
   const body = claim.json || {};
   const already = claim.status === 409 || body.result === 'ALREADY_CLAIMED' || body.replayed === true;
+  let claimOutcome = 'rejected';
 
   if (already) {
     acct.lastState = 'already';
     acct.lastOkDate = today;
     acct.lastMsg = '今日已领取';
+    claimOutcome = 'success';
   } else if (claim.status === 200 || claim.status === 201) {
     const pick = (o) => (o && typeof o === 'object' ? o : {});
     const b1 = pick(body.benefit).amount ?? pick(body.reward).amount ?? body.credits ?? body.creditAmount;
@@ -2691,6 +2827,7 @@ async function signinOne(env, acct, { force = false } = {}) {
     if (body.status && body.status !== 'CLAIMED') {
       acct.lastState = 'pending';
       acct.lastMsg = '提交成功但上游未确认（状态 ' + body.status + '）';
+      claimOutcome = 'uncertain';
     } else {
       acct.lastState = 'checked';
       acct.lastOkDate = today;
@@ -2698,23 +2835,27 @@ async function signinOne(env, acct, { force = false } = {}) {
       acct.totalCredit = Number(acct.totalCredit || 0) + amount;
       acct.totalSigned = Number(acct.totalSigned || 0) + 1;
       acct.lastMsg = '领取成功 +' + amount + ' credits' + typeTag;
+      claimOutcome = 'success';
     }
   } else if (claim.status === 429) {
     acct.lastState = 'error';
     acct.cooldownUntil = now + COOLDOWN_MIN * 60000;
     acct.lastMsg = '领取被限流（HTTP 429），稍后重试';
+    claimOutcome = 'blocked';
   } else if (claim.status === 401 || claim.status === 403) {
     acct.lastState = 'token_dead';
     acct.lastMsg = '领取失败，凭证已失效，请重新添加账号';
+    claimOutcome = 'blocked';
   } else {
     acct.lastState = 'error';
     const why = [body.message, body.errorMessage, body.msg, body.result, body.code]
       .find((x) => typeof x === 'string' && x.trim()) || '';
     acct.lastMsg = '领取失败（HTTP ' + claim.status + '）' + why;
+    claimOutcome = claim.status >= 500 ? 'transient' : 'rejected';
   }
 
   await putAccount(env, acct);
-  return { id: acct.id, label: acct.label, state: acct.lastState, msg: acct.lastMsg };
+  return { id: acct.id, label: acct.label, state: acct.lastState, msg: acct.lastMsg, outcome: claimOutcome };
 }
 
 /* ------------------------------------------------------------------ */
@@ -2739,6 +2880,8 @@ async function handleList(request, env) {
       lastMsg: a.lastMsg,
       lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
       lastOkDate: a.lastOkDate ?? null,
+      automationBlocked:a.automationBlocked===true,
+      conservativeAttemptDate:a.conservativeAttemptDate || null,
       lastCredit: a.lastCredit ?? null,
       totalCredit: a.totalCredit ?? 0,
       balance: typeof a.balance === 'number' ? Math.round(a.balance * 100) / 100 : null,
@@ -2759,14 +2902,14 @@ async function handleList(request, env) {
   });
 }
 
-async function handleRun(request, env, force) {
+async function handleRun(request, env, force, mode = 'run') {
   const list = await listAccounts(env);
   const results = [];
   for (const meta of list) {
     const a = await getAccount(env, meta.id);
     if (!a) continue;
     try {
-      results.push(await signinOne(env, a, { force }));
+      results.push(await signinOne(env, a, { mode }));
     } catch (e) {
       results.push({ id: a.id, label: a.label, state: 'error', msg: e.message });
     }
@@ -2977,7 +3120,8 @@ const __mod = {
       if (path === '/api/inspect' && method === 'GET') return handleInspect(request, env);
       if (path === '/api/run' && method === 'POST') {
         const force = url.searchParams.get('force') === '1';
-        return handleRun(request, env, force);
+        const mode = url.searchParams.get('mode') === 'compensate' ? 'compensate' : 'run';
+        return handleRun(request, env, force, mode);
       }
 
       return json({ error: 'not found' }, 404);
@@ -2988,6 +3132,7 @@ const __mod = {
 
   /** Cloudflare Cron Trigger 到点自动跑 */
   async scheduled(event, env, ctx) {
+    const mode = event && event.mode === 'compensate' ? 'compensate' : 'run';
     ctx.waitUntil(
       (async () => {
         const list = await listAccounts(env);
@@ -2995,7 +3140,7 @@ const __mod = {
           const acct = await getAccount(env, meta.id);
           if (!acct) continue;
           try {
-            await signinOne(env, acct, { force: false });
+            await signinOne(env, acct, { mode });
           } catch {
             /* 单账号失败不影响其他账号 */
           }
@@ -3089,6 +3234,156 @@ function qoderEnv(env) {
   };
 }
 
+const activeSignin = new Set();
+const activePermits = new Set();
+const NOON_HOUR = 12;
+function beijingDay(ms = Date.now()) { return new Date(ms + 8 * 3600e3).toISOString().slice(0, 10); }
+function beijingHour(ms = Date.now()) { return new Date(ms + 8 * 3600e3).getUTCHours(); }
+
+/** 把一次执行结果归入补偿策略：success / transient / uncertain / blocked / rejected */
+function attemptOutcome(result) {
+  if (!result) return 'uncertain';
+  if (result.outcome) return result.outcome;
+  if (result.state === 'checked' || result.state === 'already') return 'success';
+  if (result.state === 'pending') return 'uncertain';
+  if (result.state === 'token_dead' || result.state === 'rate') return 'blocked';
+  return 'uncertain';
+}
+
+async function conservativeSignin(acct, { key, save, run, verify, mode = 'run' }) {
+  const now = Date.now();
+  const today = beijingDay(now);
+  const base = { id: acct.id, label: acct.label };
+  if (activeSignin.has(key)) return { ...base, state: 'deferred', msg: '账号正在执行，不重复请求' };
+  activeSignin.add(key);
+  try {
+    if (acct.lastOkDate === today) return { ...base, state: 'skipped', msg: '今日已确认完成，只读取缓存' };
+    if (acct.automationBlocked || acct.lastState === 'token_dead') {
+      return { ...base, state: 'deferred', msg: '账号需要人工核查，自动执行已停止' };
+    }
+
+    const attemptedToday = acct.conservativeAttemptDate === today || (acct.lastRun && beijingDay(acct.lastRun) === today);
+
+    if (mode === 'compensate') {
+      if (beijingHour(now) < NOON_HOUR) {
+        return { ...base, state: 'deferred', msg: '补偿窗口未到（北京时间 12:00 后）' };
+      }
+      if (acct.compensationDate === today) {
+        return { ...base, state: 'deferred', msg: '今日补偿已使用，不再请求平台' };
+      }
+      if (attemptedToday) {
+        const outcome = acct.lastAttemptOutcome || 'uncertain';
+        if (outcome === 'success') return { ...base, state: 'skipped', msg: '今日已确认完成，只读取缓存' };
+        if (outcome === 'blocked' || outcome === 'rejected') {
+          return { ...base, state: 'deferred', msg: '上次失败类型不允许自动补签' };
+        }
+        if (outcome === 'uncertain') {
+          if (typeof verify !== 'function') {
+            return { ...base, state: 'deferred', msg: '结果不确定且没有可靠状态查询，停止自动补签' };
+          }
+          let check;
+          try { check = await verify(); } catch { check = { state: 'unknown' }; }
+          if (check.state === 'checked' || check.state === 'already') {
+            acct.lastOkDate = today;
+            acct.lastState = 'already';
+            acct.lastAttemptOutcome = 'success';
+            acct.lastMsg = '中午状态核对确认今日已签到';
+            acct.checkedIn = true;
+            await save();
+            return { ...base, state: 'already', msg: acct.lastMsg };
+          }
+          if (check.state === 'blocked') {
+            acct.automationBlocked = true;
+            await save();
+            return { ...base, state: 'deferred', msg: '中午核对被平台拒绝，自动执行已暂停' };
+          }
+          if (check.state !== 'not_signed') {
+            return { ...base, state: 'deferred', msg: '中午状态核对不可用或结果不明确，不重复提交' };
+          }
+        }
+      }
+      acct.compensationDate = today;
+      acct.conservativeAttemptDate = today;
+      await save(); // Persist before the one compensation request.
+      return await execute();
+    }
+
+    if (attemptedToday) return { ...base, state: 'deferred', msg: '保守模式：今日已尝试，不自动重试' };
+    acct.conservativeAttemptDate = today;
+    await save(); // Persist before any platform request, including uncertain outcomes.
+    return await execute();
+  } finally { activeSignin.delete(key); }
+
+  async function execute() {
+    let result;
+    try {
+      result = await run();
+    } catch (err) {
+      acct.lastAttemptOutcome = 'uncertain';
+      acct.lastState = 'error';
+      acct.lastMsg = '请求异常，结果未知：' + (err?.message || String(err));
+      acct.lastRun = Date.now();
+      await save();
+      return { ...base, state: 'error', msg: acct.lastMsg, outcome: 'uncertain' };
+    }
+    acct.lastAttemptOutcome = attemptOutcome(result);
+    if (result.state === 'token_dead' || /风控|风险账号|风险账户|captcha|验证拦截|限流|429|9074|4010|4015|HTTP 403/i.test(result.msg || '')) {
+      acct.automationBlocked = true;
+    }
+    await save();
+    return result;
+  }
+}
+
+// Register each platform once. Pages and execution use this same inventory.
+const PLATFORMS = [
+  { id: 'trae', name: 'Trae', module: Trae, env: traeEnv },
+  { id: 'wb', name: 'WorkBuddy', module: WorkBuddy, env: wbEnv },
+  { id: 'qoder', name: 'Qoder', module: Qoder, env: qoderEnv },
+  { id: 'agentrouter', name: 'AgentRouter', list: readAgentRouter },
+];
+function platformMetadata() {
+  return PLATFORMS.map(p => ({ id: p.id, name: p.name, listPath: '/' + p.id + '/api/list', runPath: p.module ? '/' + p.id + '/api/run' : null }));
+}
+function completionSummary(definitions, records, today) {
+  var accountTotal = 0, accountCompleted = 0;
+  var platforms = definitions.map(function(p) {
+    var data = records[p.id], accounts = data && Array.isArray(data.accounts) ? data.accounts : [];
+    var done = accounts.filter(function(a) { return a.signedToday === true && a.lastOkDate === today; }).length;
+    accountTotal += accounts.length; accountCompleted += done;
+    return { id:p.id, name:p.name, completed:!data || data.error ? false : accounts.length > 0 && done === accounts.length, accounts:accounts.length, confirmedAccounts:done, unavailable:!data || !!data.error };
+  });
+  return { today:today, total:platforms.length, completed:platforms.filter(function(p){return p.completed;}).length, accountTotal:accountTotal, accountCompleted:accountCompleted, platforms:platforms };
+}
+async function readAgentRouter(env) {
+  const raw = await env.KV.get('agentrouter:balance');
+  const rec = raw ? JSON.parse(raw) : null;
+  const today = beijingDay();
+  const blocked = rec ? !!(await env.KV.get('agentrouter:blocked:' + rec.label)) : false;
+  const outcomeRaw = rec ? await env.KV.get('agentrouter:outcome:' + rec.label) : null;
+  const outcome = outcomeRaw ? JSON.parse(outcomeRaw) : null;
+  const compensationUsed = rec ? await env.KV.get('agentrouter:compensate:' + rec.label) === today : false;
+  const accounts = rec ? [{ label:rec.label || 'agentrouter', balance:rec.balance, balanceAt:rec.at,
+    updatedToday:beijingDay(rec.at) === today, today, lastOkDate:rec.lastOkDate || null,
+    signedToday:rec.lastOkDate === today, automationBlocked:blocked, lastState:blocked ? 'token_dead' : rec.lastOkDate === today ? 'checked' : 'unknown',
+    checkinEvidence:rec.checkinEvidence || null,
+    lastAttemptOutcome:outcome && outcome.date === today ? outcome.outcome : null,
+    compensationUsed }] : [];
+  return { count:accounts.length, today, accounts };
+}
+async function cachedPlatformRecords(env, origin) {
+  const entries = await Promise.all(PLATFORMS.map(async p => {
+    try {
+      if (p.list) return [p.id, await p.list(env)];
+      const request = new Request(origin + '/api/list', { headers:{'X-Admin-Token':String(env.ADMIN_TOKEN || '')} });
+      const response = await p.module.fetch(request, p.env(env), { waitUntil(){} });
+      if (!response.ok) throw new Error('列表读取失败');
+      return [p.id, await response.json()];
+    } catch { return [p.id, { accounts:[], error:'列表读取失败' }]; }
+  }));
+  return Object.fromEntries(entries);
+}
+
 /* ---------------- 通用响应与鉴权 ---------------- */
 
 function json(data, status = 200) {
@@ -3142,8 +3437,9 @@ function repath(request, path) {
 }
 
 /** 以内部请求的方式驱动某个平台的 /api/run，拿到它的汇总 */
-async function runPlatform(mod, env, origin, force) {
+async function runPlatform(mod, env, origin, force, mode = 'run') {
   const target = new URL('/api/run' + (force ? '?force=1' : ''), origin);
+  if (mode === 'compensate') target.searchParams.set('mode', 'compensate');
   const req = new Request(target.toString(), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Admin-Token': String(env.ADMIN_TOKEN || '') },
@@ -3154,21 +3450,19 @@ async function runPlatform(mod, env, origin, force) {
   return data;
 }
 
-async function runAll(env, origin, force) {
+async function runAll(env, origin, force, mode = 'run') {
   const out = {};
-  for (const [key, mod, e] of [
-    ['trae', Trae, traeEnv(env)],
-    ['wb', WorkBuddy, wbEnv(env)],
-    ['qoder', Qoder, qoderEnv(env)],
-  ]) {
+  for (const p of PLATFORMS.filter(p => p.module)) {
+    const key = p.id, mod = p.module, e = p.env(env);
     try {
-      out[key] = await runPlatform(mod, e, origin, force);
+      out[key] = await runPlatform(mod, e, origin, force, mode);
     } catch (err) {
       out[key] = { error: err.message || String(err) };
     }
   }
   const result = {
     at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
+    mode,
     ...out,
   };
   // 通知放在最后：失败只记一笔，不能影响签到结果
@@ -3504,7 +3798,7 @@ async function sendQQ(cfg, text) {
 }
 
 /* ---- 汇总文本 ---- */
-const PLATFORM_LABEL = { trae: 'Trae', wb: 'WorkBuddy', qoder: 'Qoder' };
+const PLATFORM_LABEL = Object.fromEntries(PLATFORMS.map(p => [p.id,p.name]));
 
 function tally(d) {
   const rs = Array.isArray(d?.results) ? d.results : [];
@@ -3523,7 +3817,7 @@ function formatReport(result) {
   lines.push('📋 签到完成 · ' + (at ? at.slice(5, 16) : ''));
 
   let anyBad = false;
-  for (const key of ['trae', 'wb', 'qoder']) {
+  for (const key of PLATFORMS.map(p => p.id)) {
     const d = result[key];
     const name = PLATFORM_LABEL[key];
     if (!d) continue;
@@ -3575,7 +3869,7 @@ async function notifyRun(env, result) {
 /* ------------------------------------------------------------------ */
 
 /* 页面版本号：改这个就能确认线上跑的是不是新代码（问「改了怎么没生效」时先看它） */
-const BUILD = '2026-11-02';
+const BUILD = '2026-11-17.3';
 
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -3864,7 +4158,7 @@ const PAGE = `<!DOCTYPE html>
       <div class="row">
         <span class="chip"><i class="dot"></i>今日已签 <b id="statAll">—</b></span>
         <a class="gh" href="/" title="返回余额总览">余额总览</a>
-        <button id="runAll" class="pri">全部签到</button>
+        <button id="runAll" class="pri" title="只运行当天尚未尝试的内置平台账号；外部平台由各自计划任务执行">执行未完成签到</button>
         <button id="notifyOpen" title="配置签到结果通知">通知</button>
         <button id="logout">退出登录</button>
       </div>
@@ -3951,7 +4245,7 @@ const PAGE = `<!DOCTYPE html>
         <div class="col">
           <div class="card">
             <div class="card-head"><h2>说明</h2></div>
-            <div class="hint">AgentRouter 采用「登录式签到」：本机签到脚本每天登录一次自动领取 $25，并把最新余额推送到这里。此页只读，签到由计划任务 AgentRouter-CheckIn（每日 10:20 / 22:20）在本机执行。</div>
+            <div class="hint">AgentRouter 采用「登录式签到」：本机脚本登录并查询余额，再推送到这里；是否发放奖励由平台决定。此页只读，签到由本机计划任务执行，每天最多一轮；此处「刷新」只读缓存，完成数只认当日确认回执。</div>
           </div>
         </div>
       </div>
@@ -3987,9 +4281,10 @@ const PAGE = `<!DOCTYPE html>
 
 </div>
 <script>
+${completionSummary.toString()}
 var $ = function(s){ return document.querySelector(s); };
 var PWD_KEY = 'signin-admin-pwd';
-var state = { tok:'', tab:'trae', data:{ trae:null, wb:null, qoder:null } };
+var state = { tok:'', tab:'trae', data:{}, platforms:null, platformPromise:null };
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];
@@ -4105,7 +4400,7 @@ function login(password){
 function logout(msg){
   stopWbQr(); stopQoderQr();
   state.tok = '';
-  state.data = { trae:null, wb:null, qoder:null };
+  state.data = {}; state.platforms=null;
   localStorage.removeItem(PWD_KEY);
   $('#pwd').value = '';
   $('#list-trae').innerHTML = '<div class="empty">加载中…</div>';
@@ -4180,7 +4475,7 @@ function renderWb(d){
 
 function renderAgentRouter(d){
   var box = $('#list-agentrouter'), accs = (d.accounts || []);
-  var upd = accs.filter(function(a){ return a.updatedToday; }).length;
+  var upd = accs.filter(function(a){ return a.signedToday; }).length;
   $('#cntAgentRouter').textContent = upd + '/' + accs.length;
   function t(ms){ return ms ? new Date(ms + 8 * 3600e3).toISOString().replace('T',' ').slice(5,16) : '—'; }
   $('#lastRun-agentrouter').textContent = accs.length ? t(accs[0].balanceAt) : '—';
@@ -4191,7 +4486,7 @@ function renderAgentRouter(d){
           + '<td>' + esc(a.label) + '</td>'
           + '<td class="num">' + ('$' + (a.balance != null ? Number(a.balance).toFixed(2) : '—')) + '</td>'
           + '<td class="time">' + esc(t(a.balanceAt)) + '</td>'
-          + '<td>' + (a.updatedToday ? '<span class="tag t-ok">今日已更新</span>' : '<span class="tag t-idle">未更新</span>') + '</td>'
+          + '<td>' + (a.signedToday ? '<span class="tag t-ok">今日已签</span>' : '<span class="tag t-idle">签到未确认</span>') + '</td>'
           + '</tr>';
       }).join('') + '</tbody></table>'
     + '<div class="thint">余额由本机签到脚本推送，此页只读</div>';
@@ -4291,19 +4586,42 @@ function bindDel(){
 }
 
 function renderStat(){
-  var loaded = ['trae','wb','qoder'].filter(function(k){ return state.data[k]; });
-  if(!loaded.length){ $('#statAll').textContent = '—'; return; }
-  var all = [];
-  loaded.forEach(function(k){ all = all.concat(state.data[k].accounts || []); });
-  var signed = all.filter(function(a){ return a.signedToday; }).length;
-  $('#statAll').textContent = signed + ' / ' + all.length;
+  if(!state.platforms){ $('#statAll').textContent='—'; return; }
+  var summary=completionSummary(state.platforms,state.data,bjToday());
+  $('#statAll').textContent=summary.completed+' / '+summary.total;
+  $('#statAll').title='按平台统计；平台内全部账号确认完成才计入。账号 '+summary.accountCompleted+' / '+summary.accountTotal;
+}
+function ensurePlatforms(){
+  if(state.platforms)return Promise.resolve(state.platforms);
+  if(state.platformPromise)return state.platformPromise;
+  state.platformPromise=api('/api/platforms').then(function(d){
+    state.platforms=d.platforms;
+    d.platforms.forEach(function(p){
+      API_URL.list[p.id]=p.listPath;
+      if(p.runPath)API_URL.run[p.id]=p.runPath;
+      API_URL.name[p.id]=p.name;
+      if(!$('#panel-'+p.id)){
+        var button=document.createElement('button');button.className='tab';button.dataset.tab=p.id;button.textContent=p.name;
+        document.querySelector('.tabs').appendChild(button);
+        var panel=document.createElement('section');panel.id='panel-'+p.id;panel.className='panel';panel.hidden=true;
+        panel.innerHTML='<div class="card"><div class="err" id="err-'+esc(p.id)+'"></div><div id="list-'+esc(p.id)+'"></div></div>';
+        $('#mainView').appendChild(panel);
+      }
+    });
+    bindTabs();return state.platforms;
+  }).finally(function(){state.platformPromise=null;});
+  return state.platformPromise;
+}
+function renderGeneric(p,d){
+  var accounts=d.accounts||[];
+  $('#list-'+p).innerHTML=accounts.length?'<table><thead><tr><th>账号</th><th>余额</th><th>签到状态</th></tr></thead><tbody>'+accounts.map(function(a){return '<tr><td>'+esc(a.label)+'</td><td>'+esc(fmt(a.balance))+'</td><td>'+(a.signedToday?'已签':'未确认')+'</td></tr>';}).join('')+'</tbody></table>':'<div class="empty">尚未配置账号</div>';
 }
 
 /* ---------------- 加载与签到 ---------------- */
 
 var API_URL = {
   list:  { trae:'/trae/api/list', wb:'/wb/api/list', qoder:'/qoder/api/list', agentrouter:'/agentrouter/api/list' },
-  run:   { trae:'/trae/api/run?force=1', wb:'/wb/api/run?force=1', qoder:'/qoder/api/run?force=1' },
+  run:   { trae:'/trae/api/run', wb:'/wb/api/run', qoder:'/qoder/api/run' },
   rename:{ trae:'/trae/api/rename', wb:'/wb/api/rename', qoder:'/qoder/api/rename' },
   remove:{ trae:'/trae/api/accounts/remove', wb:'/wb/api/remove', qoder:'/qoder/api/remove' },
   name:  { trae:'Trae', wb:'WorkBuddy', qoder:'Qoder' }
@@ -4312,17 +4630,19 @@ var API_URL = {
 function load(p){
   return api(API_URL.list[p])
     .then(function(d){
+      state.data[p]=d;
       if(p === 'agentrouter') renderAgentRouter(d);
       else if(p === 'trae') renderTrae(d);
       else if(p === 'wb') renderWb(d);
-      else renderQoder(d);
+      else if(p === 'qoder') renderQoder(d);
+      else renderGeneric(p,d);
       renderStat();
     })
     .catch(function(e){ showErr(p, e); renderStat(); });
 }
 
 function loadAll(){
-  return Promise.all([load('trae'), load('wb'), load('qoder'), load('agentrouter')]);
+  return ensurePlatforms().then(function(definitions){return Promise.all(definitions.map(function(p){return load(p.id);}));}).catch(function(e){showErr('trae',e);$('#statAll').textContent='—';});
 }
 
 function runOne(p){
@@ -4331,7 +4651,7 @@ function runOne(p){
   showErr(p, '');
   return api(API_URL.run[p], { method:'POST', body:'{}' })
     .then(function(d){
-      var bad = (d.results || []).filter(function(r){ return r.state==='error' || r.state==='token_dead'; });
+      var bad = (d.results || []).filter(function(r){ return r.state==='error' || r.state==='token_dead' || r.state==='deferred'; });
       if(bad.length) showErr(p, bad.map(function(r){ return r.label + ': ' + r.msg; }).join('\\n'));
       return load(p);
     })
@@ -4345,14 +4665,14 @@ function runAll(){
   var btn = $('#runAll');
   btn.disabled = true; btn.textContent = '签到中…';
   showErr('trae',''); showErr('wb','');
-  api('/api/run-all?force=1', { method:'POST', body:'{}' })
+  api('/api/run-all', { method:'POST', body:'{}' })
     .then(function(d){
       var lines = [];
-      ['trae','wb','qoder'].forEach(function(k){
-        var r = d[k] || {};
+      (state.platforms||[]).filter(function(p){return p.runPath;}).forEach(function(p){
+        var k=p.id, r = d[k] || {};
         if(r.error){ lines.push(API_URL.name[k] + ': ' + r.error); return; }
         (r.results || []).forEach(function(x){
-          if(x.state==='error' || x.state==='token_dead') lines.push(x.label + ': ' + x.msg);
+          if(x.state==='error' || x.state==='token_dead' || x.state==='deferred') lines.push(x.label + ': ' + x.msg);
         });
       });
       if(lines.length){
@@ -4361,19 +4681,21 @@ function runAll(){
       return loadAll();
     })
     .catch(function(e){ showErr('trae', e); })
-    .then(function(){ btn.disabled = false; btn.textContent = '全部签到'; });
+    .then(function(){ btn.disabled = false; btn.textContent = '执行未完成签到'; });
 }
 
 /* ---------------- 标签页 ---------------- */
 
-document.querySelectorAll('.tab').forEach(function(t){
-  t.onclick = function(){
-    var p = t.dataset.tab;
-    state.tab = p;
-    document.querySelectorAll('.tab').forEach(function(x){ x.classList.toggle('on', x === t); });
-    ['trae','wb','qoder','agentrouter'].forEach(function(k){ $('#panel-' + k).hidden = p !== k; });
-  };
-});
+function bindTabs(){
+  document.querySelectorAll('.tab').forEach(function(t){
+    t.onclick=function(){
+      var p=t.dataset.tab;state.tab=p;
+      document.querySelectorAll('.tab').forEach(function(x){x.classList.toggle('on',x===t);});
+      (state.platforms||[]).forEach(function(k){var panel=$('#panel-'+k.id);if(panel)panel.hidden=k.id!==p;});
+    };
+  });
+}
+bindTabs();
 
 /* ---------------- Trae 扫码登录 ---------------- */
 
@@ -4627,6 +4949,7 @@ setInterval(function(){
   if(d !== dayMark){ dayMark = d; if(state.tok) loadAll(); }
 }, 60000);
 
+// No periodic balance polling. Date changes only re-read the local cache.
 var saved = localStorage.getItem(PWD_KEY);
 if(saved) login(saved);
 </script>
@@ -4778,6 +5101,8 @@ const DASHBOARD = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>签到总览</title>
+<meta name="agentrouter-fix" content="2026-11-17">
+<meta name="checkin-policy" content="daily-once-with-noon-compensation-2026-11-17.3">
 ${SHARED_STYLE}
 </head>
 <body>
@@ -4791,7 +5116,8 @@ ${SHARED_STYLE}
       </div>
     </div>
     <div class="actions">
-      <button id="refresh">刷新余额</button>
+      <span class="chip"><i class="dot"></i>今日已签 <b id="dashboardStat">—</b></span>
+      <button id="refresh">刷新列表</button>
       <button onclick="location.href='/console'">完整控制台</button>
       <button id="logout">退出登录</button>
     </div>
@@ -4813,6 +5139,7 @@ ${SHARED_STYLE}
       <div class="card-head">
         <h2>当前剩余额度</h2>
         <div class="meta" id="upd">—</div>
+        <div class="hint" id="status" role="status" aria-live="polite"></div>
       </div>
       <div class="list">
         <table>
@@ -4820,44 +5147,92 @@ ${SHARED_STYLE}
           <tbody id="rows"><tr><td colspan="4">加载中…</td></tr></tbody>
         </table>
       </div>
-      <div class="hint">余额在每日签到时自动更新；点「刷新余额」立即重跑一轮。</div>
+      <div class="hint">保守模式：打开页面和「刷新列表」只读取本地缓存；每账号每天最多一轮，不自动重试。「今日已签」按平台统计，余额更新不等于签到完成。</div>
     </div>
   </div>
 </div>
 <script>
+${completionSummary.toString()}
 var KEY='signin-admin-pwd';
 var tok=localStorage.getItem(KEY)||'';
+var platforms=[], definitions=null, discovery=null;
+var cache={}, listErrors={}, refreshErrors={}, pending={};
+function inventory(){
+  if(definitions)return Promise.resolve(definitions);
+  if(discovery)return discovery;
+  discovery=requestJSON('/api/platforms').then(function(d){definitions=d.platforms;platforms=d.platforms.map(function(p){return [p.id,p.name];});return definitions;}).finally(function(){discovery=null;});
+  return discovery;
+}
 function $(s){return document.querySelector(s);}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-function fmt(n){return (n==null)?'—':String(n);}
-function api(p){return fetch(p,{headers:{'X-Admin-Token':tok}}).then(function(r){if(r.status===401)throw new Error('auth');return r.json();});}
-function tag(a){if(a.lastState==='token_dead')return '<span class="tag t-bad">令牌失效</span>';if(a.signedToday)return '<span class="tag t-ok">已签</span>';return '<span class="tag t-idle">今日未签</span>';}
-function row(plat,a,bal){return '<tr><td>'+plat+'</td><td>'+esc(a.label)+'</td><td class="num">'+fmt(bal)+'</td><td>'+tag(a)+'</td></tr>';}
-function load(){
-  return Promise.all([api('/trae/api/list'),api('/wb/api/list'),api('/qoder/api/list'),api('/agentrouter/api/list')]).then(function(rs){
-    var html='';
-    (rs[0].accounts||[]).forEach(function(a){html+=row('Trae',a,a.credits);});
-    (rs[1].accounts||[]).forEach(function(a){html+=row('WorkBuddy',a,a.balance);});
-    (rs[2].accounts||[]).forEach(function(a){html+=row('Qoder',a,a.balance);});
-    (rs[3].accounts||[]).forEach(function(a){html+='<tr><td>AgentRouter</td><td>'+esc(a.label)+'</td><td class="num">'+('$'+(a.balance!=null?a.balance.toFixed(2):'—'))+'</td><td>'+(a.updatedToday?'<span class="tag t-ok">已更新</span>':'<span class="tag t-idle">未更新</span>')+'</td></tr>';});
-    $('#rows').innerHTML=html||'<tr><td colspan="4">暂无账号</td></tr>';
-    $('#upd').textContent='更新于 '+new Date().toTimeString().slice(0,8);
-  });
+function fmt(n){return typeof n==='number'&&Number.isFinite(n)?String(n):'—';}
+function status(){
+  var lines=[];
+  platforms.forEach(function(p){if(listErrors[p[0]])lines.push(p[1]+' 列表：'+listErrors[p[0]]);});
+  Object.keys(refreshErrors).forEach(function(k){lines.push(k+'：'+refreshErrors[k]);});
+  $('#status').textContent=lines.join('；');
 }
-function logout(){tok='';localStorage.removeItem(KEY);$('#mainView').hidden=true;$('#loginView').hidden=false;}
-function show(){$('#loginView').hidden=true;$('#mainView').hidden=false;load().catch(function(e){if(String(e.message)==='auth')logout();});}
+function requestJSON(path,opts,timeout){
+  opts=opts||{};
+  var ctrl=new AbortController(), timer;
+  var headers=opts.headers||{};
+  if(path.charAt(0)==='/')headers['X-Admin-Token']=tok;
+  return new Promise(function(resolve,reject){
+    timer=setTimeout(function(){ctrl.abort();reject(new Error('请求超时，请查看任务状态后再试'));},timeout||10000);
+    fetch(path,{method:opts.method||'GET',body:opts.body,headers:headers,signal:ctrl.signal,cache:'no-store'})
+      .then(function(r){return r.json().then(function(d){
+        if(r.status===401&&path.charAt(0)==='/'){logout();throw new Error('登录已失效');}
+        if(!d||typeof d!=='object')throw new Error('响应格式无效');
+        if(!r.ok||d.ok===false)throw new Error(d.error||('HTTP '+r.status));
+        return d;
+      });}).then(resolve,reject);
+  }).finally(function(){clearTimeout(timer);});
+}
+function tag(a){if(a.lastState==='token_dead')return '<span class="tag t-bad">令牌失效</span>';if(a.signedToday)return '<span class="tag t-ok">已签</span>';return '<span class="tag t-idle">今日未签</span>';}
+function render(){
+  var html='';
+  platforms.forEach(function(p){
+    var records=cache[p[0]];
+    if(!records)return;
+    records.forEach(function(a){
+      var bal=p[0]==='trae'?a.credits:a.balance;
+      var value=p[0]==='agentrouter'?(typeof bal==='number'&&Number.isFinite(bal)?'$'+bal.toFixed(2):'—'):fmt(bal);
+      var state=p[0]==='agentrouter'?(a.signedToday?'<span class="tag t-ok">已签</span>':'<span class="tag t-idle">签到未确认</span>'):tag(a);
+      var time=a.balanceAt?new Date(a.balanceAt).toLocaleString('zh-CN'):'未知';
+      var hint=p[0]==='trae'?'':('<div class="hint">余额采集：'+esc(time)+'</div>');
+      if(listErrors[p[0]])hint+='<div class="hint">列表读取失败，保留上次数据</div>';
+      html+='<tr><td>'+p[1]+'</td><td>'+esc(a.label)+'</td><td class="num">'+esc(value)+hint+'</td><td>'+state+'</td></tr>';
+    });
+  });
+  $('#rows').innerHTML=html||'<tr><td colspan="4">'+(Object.keys(listErrors).length?'暂时无法读取账号，请查看错误提示':'暂无账号')+'</td></tr>';
+  var records={};platforms.forEach(function(p){if(cache[p[0]])records[p[0]]={accounts:cache[p[0]],error:listErrors[p[0]]};});
+  var summary=completionSummary(definitions||[],records,new Date(Date.now()+8*3600e3).toISOString().slice(0,10));
+  $('#dashboardStat').textContent=summary.completed+' / '+summary.total;
+  status();
+}
+function loadOne(p){
+  if(pending[p])return pending[p];
+  pending[p]=requestJSON('/'+p+'/api/list').then(function(d){
+    if(!Array.isArray(d.accounts))throw new Error('账号列表响应无效');
+    cache[p]=d.accounts;delete listErrors[p];
+    $('#upd').textContent='列表读取于 '+new Date().toTimeString().slice(0,8);
+  }).catch(function(e){listErrors[p]=e.message||String(e);}).finally(function(){delete pending[p];render();});
+  return pending[p];
+}
+function load(){return inventory().then(function(){return Promise.all(platforms.map(function(p){return loadOne(p[0]);}));}).catch(function(e){refreshErrors['平台发现']=e.message;status();});}
+function logout(){tok='';cache={};localStorage.removeItem(KEY);$('#rows').innerHTML='';$('#mainView').hidden=true;$('#loginView').hidden=false;}
+function show(){$('#loginView').hidden=true;$('#mainView').hidden=false;load();}
 function login(){
   var v=$('#pwd').value.trim();if(!v)return;
-  fetch('/api/ping',{headers:{'X-Admin-Token':v}}).then(function(r){if(!r.ok)throw new Error('密码不正确');tok=v;localStorage.setItem(KEY,v);$('#loginerr').textContent='';show();}).catch(function(e){$('#loginerr').textContent=e.message;});
+  tok=v;
+  requestJSON('/api/ping').then(function(){localStorage.setItem(KEY,v);$('#loginerr').textContent='';show();}).catch(function(e){tok='';$('#loginerr').textContent=e.message;});
 }
 $('#loginbtn').onclick=login;
 $('#pwd').onkeydown=function(e){if(e.key==='Enter')login();};
 $('#logout').onclick=logout;
 $('#refresh').onclick=function(){
-  var b=$('#refresh');b.disabled=true;b.textContent='刷新中…';
-  var p1=fetch('/api/run-all?force=1',{method:'POST',headers:{'X-Admin-Token':tok}}).catch(function(){});
-  var p2=fetch('http://'+location.hostname+':8788/refresh',{method:'POST'}).catch(function(){});
-  Promise.all([p1,p2]).then(function(){return load();}).catch(function(){}).then(function(){b.disabled=false;b.textContent='刷新余额';});
+  var b=$('#refresh');if(b.disabled)return;b.disabled=true;b.textContent='读取中…';
+  load().finally(function(){b.disabled=false;b.textContent='刷新列表';});
 };
 if(tok){show();}
 </script>
@@ -4877,13 +5252,20 @@ export default {
       if (path === '/cron') {
         const c = requireCron(request, env);
         if (!c.ok) return c.res;
-        return json(await runAll(env, url.origin, false));
+        const mode = beijingHour() >= NOON_HOUR ? 'compensate' : 'run';
+        return json(await runAll(env, url.origin, false, mode));
       }
 
       // Trae 的授权链接里回调地址写死为 <origin>/oauth/callback，必须留在根路径
       if (path === '/oauth/callback' && method === 'GET') return await Trae.fetch(request, traeEnv(env), ctx);
       if (path === '/oauth/probe') {
         return new Response('ok', { headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' } });
+      }
+
+      if ((path === '/api/platforms' || path === '/api/summary') && method === 'GET') {
+        const a = requireAdmin(request, env); if (!a.ok) return a.res;
+        if (path === '/api/platforms') return json({ platforms:platformMetadata(), policy:{workflowsPerAccountPerDay:1, noonCompensationsPerAccountPerDay:1, automaticRetries:0, pageReads:'cache-only'} });
+        return json(completionSummary(platformMetadata(), await cachedPlatformRecords(env, url.origin), beijingDay()));
       }
 
       if (path === '/api/ping' && method === 'GET') {
@@ -4963,6 +5345,68 @@ export default {
         return json({ ...r, channels: Object.keys(ch) });
       }
 
+      if (path === '/agentrouter/api/permit' && method === 'POST') {
+        const a = requireAdmin(request, env); if (!a.ok) return a.res;
+        const body = await request.json();
+        const label = String(body.label || '').slice(0,40);
+        if (!label) return json({error:'label 必填'},400);
+        if (activePermits.has(label)) return json({ok:true,allowed:false,action:'none',reason:'账号许可处理中'});
+        activePermits.add(label);
+        try {
+          const today = beijingDay(), now = Date.now(), hour = beijingHour(now);
+          const attemptKey = 'agentrouter:attempt:' + label;
+          const blockedKey = 'agentrouter:blocked:' + label;
+          const outcomeKey = 'agentrouter:outcome:' + label;
+          const compensateKey = 'agentrouter:compensate:' + label;
+          if (body.blocked === true) { await env.KV.put(blockedKey,'true'); return json({ok:true,allowed:false,action:'none',reason:'平台风险或认证限制，需要人工核查'}); }
+          if (body.clearBlock === true) { await env.KV.delete(blockedKey); return json({ok:true,allowed:false,action:'none',reason:'已解除本地暂停；不会立即执行，也不重置当天额度'}); }
+          if (await env.KV.get(blockedKey)) return json({ok:true,allowed:false,action:'none',reason:'账号需要人工核查，自动执行已暂停'});
+          const saved = await readAgentRouter(env);
+          if (saved.accounts.some(a => a.label === label && a.lastOkDate === today)) {
+            return json({ok:true,allowed:false,action:'none',reason:'今日已确认完成'});
+          }
+          const attempted = await env.KV.get(attemptKey) === today;
+          const outcomeRaw = await env.KV.get(outcomeKey);
+          const outcome = outcomeRaw ? JSON.parse(outcomeRaw) : null;
+          const outcomeToday = outcome && outcome.date === today ? outcome.outcome : null;
+          const wantsCompensation = body.mode === 'compensate' || (attempted && hour >= NOON_HOUR);
+          if (wantsCompensation) {
+            if (hour < NOON_HOUR) return json({ok:true,allowed:false,action:'none',reason:'补偿窗口未到（北京时间 12:00 后）'});
+            if (await env.KV.get(compensateKey) === today) {
+              return json({ok:true,allowed:false,action:'none',reason:'今日补偿已使用，不再请求平台'});
+            }
+            if (outcomeToday === 'success_unsynced') {
+              return json({ok:true,allowed:false,action:'sync',reason:'本地已有签到回执，只补同步'});
+            }
+            if (outcomeToday === 'success') return json({ok:true,allowed:false,action:'none',reason:'今日已确认完成'});
+            if (outcomeToday === 'transient' || !attempted) {
+              await env.KV.put(compensateKey, today);
+              await env.KV.put(attemptKey, today);
+              await env.KV.put(outcomeKey, JSON.stringify({date:today, outcome:'pending', at:now}));
+              return json({ok:true,allowed:true,action:'run',today,compensation:true});
+            }
+            return json({ok:true,allowed:false,action:'none',reason:'上次结果不确定或已拒绝，不自动补签'});
+          }
+          if (attempted) return json({ok:true,allowed:false,action:'none',reason:'今日已尝试，不自动重试'});
+          await env.KV.put(attemptKey, today);
+          await env.KV.put(outcomeKey, JSON.stringify({date:today, outcome:'pending', at:now}));
+          return json({ok:true,allowed:true,action:'run',today});
+        } finally { activePermits.delete(label); }
+      }
+
+      // AgentRouter 结果上报：只由本机脚本调用，供中午补偿判断是否值得再试
+      if (path === '/agentrouter/api/attempt' && method === 'POST') {
+        const a = requireAdmin(request, env); if (!a.ok) return a.res;
+        const body = await request.json().catch(() => ({}));
+        const label = String(body.label || '').slice(0,40);
+        const allowed = ['transient','uncertain','rejected','blocked','success','success_unsynced'];
+        if (!label || !allowed.includes(body.outcome)) return json({error:'label 或 outcome 无效'},400);
+        const today = beijingDay(), now = Date.now();
+        await env.KV.put('agentrouter:outcome:' + label, JSON.stringify({date:today, outcome:body.outcome, at:now}));
+        if (body.outcome === 'blocked') await env.KV.put('agentrouter:blocked:' + label, 'true');
+        return json({ok:true,label,outcome:body.outcome,date:today});
+      }
+
       // AgentRouter 余额：由本机签到脚本推送后存 KV，供主页展示
       if (path === '/agentrouter/api/balance' && method === 'POST') {
         const a = requireAdmin(request, env);
@@ -4970,37 +5414,34 @@ export default {
         const body = await request.json().catch(() => ({}));
         const bal = Number(body.balance);
         if (!Number.isFinite(bal)) return json({ error: 'balance 无效' }, 400);
-        const rec = { label: String(body.label || '').slice(0, 40), balance: bal, at: Date.now() };
+        const label = String(body.label || '').slice(0,40);
+        const raw = await env.KV.get('agentrouter:balance'), previous = raw ? JSON.parse(raw) : null;
+        const now = Date.now(), today = beijingDay(now), proof = body.checkin;
+        const observed = body.balanceAt == null ? now : Number(body.balanceAt);
+        if (!Number.isFinite(observed) || observed <= 0 || observed > now) return json({error:'balanceAt 无效'},400);
+        const confirmed = proof && proof.confirmed === true && proof.date === today && proof.source === 'login_response.checked_in';
+        const sameAccount = previous && previous.label === label;
+        const rec = { label, balance:bal, at:observed,
+          lastOkDate:confirmed ? today : (sameAccount ? previous.lastOkDate || null : null),
+          checkinEvidence:confirmed ? {source:proof.source,date:today,observedAt:proof.observedAt || now} : (sameAccount ? previous.checkinEvidence || null : null) };
         await env.KV.put('agentrouter:balance', JSON.stringify(rec));
         return json({ ok: true, ...rec });
       }
       if (path === '/agentrouter/api/list' && method === 'GET') {
         const a = requireAdmin(request, env);
         if (!a.ok) return a.res;
-        const raw = await env.KV.get('agentrouter:balance');
-        const rec = raw ? JSON.parse(raw) : null;
-        const today = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
-        const accounts = rec
-          ? [{
-              label: rec.label || 'agentrouter',
-              balance: rec.balance,
-              balanceAt: rec.at,
-              updatedToday: new Date(rec.at + 8 * 3600e3).toISOString().slice(0, 10) === today,
-            }]
-          : [];
-        return json({ count: accounts.length, today, accounts });
+        return json(await readAgentRouter(env));
       }
 
-      // 平台命名空间：/trae/api/* → 模块内的 /api/*
-      if (path === '/trae' || path === '/wb' || path === '/qoder') return Response.redirect(url.origin + '/', 302);
-      if (path.startsWith('/trae/')) {
-        return await Trae.fetch(repath(request, path.slice(5) || '/'), traeEnv(env), ctx);
+      const cachedProvider = PLATFORMS.find(p => p.list && path === '/' + p.id + '/api/list');
+      if (cachedProvider && method === 'GET') {
+        const a = requireAdmin(request, env); if (!a.ok) return a.res;
+        return json(await cachedProvider.list(env));
       }
-      if (path.startsWith('/wb/')) {
-        return await WorkBuddy.fetch(repath(request, path.slice(3) || '/'), wbEnv(env), ctx);
-      }
-      if (path.startsWith('/qoder/')) {
-        return await Qoder.fetch(repath(request, path.slice(6) || '/'), qoderEnv(env), ctx);
+      for (const platform of PLATFORMS.filter(p => p.module)) {
+        const prefix = '/' + platform.id;
+        if (path === prefix) return Response.redirect(url.origin + '/',302);
+        if (path.startsWith(prefix + '/')) return await platform.module.fetch(repath(request,path.slice(prefix.length)), platform.env(env),ctx);
       }
 
       return json({ error: 'not found' }, 404);
@@ -5011,17 +5452,16 @@ export default {
 
   /** Cloudflare Cron Trigger：三个平台依次签到，互不影响 */
   async scheduled(event, env, ctx) {
+    const mode = event && event.cron === '0 4 * * *' ? 'compensate'
+      : beijingHour() >= NOON_HOUR ? 'compensate' : 'run';
     ctx.waitUntil(
       (async () => {
         const pending = [];
         const sink = { waitUntil: (p) => pending.push(p) };
-        for (const [mod, e] of [
-          [Trae, traeEnv(env)],
-          [WorkBuddy, wbEnv(env)],
-          [Qoder, qoderEnv(env)],
-        ]) {
+        for (const p of PLATFORMS.filter(p => p.module)) {
+          const mod = p.module, e = p.env(env);
           try {
-            await mod.scheduled({}, e, sink);
+            await mod.scheduled({ mode }, e, sink);
           } catch {
             /* 一个平台整体失败不影响另一个 */
           }
@@ -5031,3 +5471,5 @@ export default {
     );
   },
 };
+
+export { PLATFORMS, completionSummary, conservativeSignin };

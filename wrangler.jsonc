@@ -8,6 +8,6 @@
   "kv_namespaces": [
     { "binding": "KV", "id": "00000000000000000000000000000000" }
   ],
-  "triggers": { "crons": ["10 0 * * *"] },
+  "triggers": { "crons": ["20 2 * * *", "0 4 * * *"] },
   "observability": { "enabled": true }
 }
